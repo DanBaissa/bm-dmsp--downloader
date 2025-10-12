@@ -1,0 +1,310 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MD_Metadata xmlns="http://www.isotc211.org/2005/gmd" xmlns:gml="http://www.opengis.net/gml" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:gco="http://www.isotc211.org/2005/gco" xmlns:gts="http://www.isotc211.org/2005/gts" xmlns:srv="http://www.isotc211.org/2005/srv" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.isotc211.org/2005/gmd https://www.isotc211.org/2005/gmd/metadataEntity.xsd">
+	<language>
+		<LanguageCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#LanguageCode" codeListValue="eng">eng</LanguageCode>
+	</language>
+	<hierarchyLevel>
+		<MD_ScopeCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#MD_ScopeCode" codeListValue="dataset">dataset</MD_ScopeCode>
+	</hierarchyLevel>
+	<contact>
+		<CI_ResponsibleParty>
+			<organisationName>
+				<gco:CharacterString>Human Geography, Geospatial Science and Human Security Division, Oak Ridge National Laboratory</gco:CharacterString>
+			</organisationName>
+			<contactInfo>
+				<CI_Contact>
+					<address>
+						<CI_Address>
+							<electronicMailAddress>
+								<gco:CharacterString>landscan@ornl.gov</gco:CharacterString>
+							</electronicMailAddress>
+						</CI_Address>
+					</address>
+					<onlineResource>
+						<CI_OnlineResource>
+							<linkage>
+								<URL>https://landscan.ornl.gov</URL>
+							</linkage>
+						</CI_OnlineResource>
+					</onlineResource>
+				</CI_Contact>
+			</contactInfo>
+			<role>
+				<CI_RoleCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#CI_RoleCode" codeListValue="pointOfContact" codeSpace="ISOTC211/19115">pointOfContact</CI_RoleCode>
+			</role>
+		</CI_ResponsibleParty>
+	</contact>
+	<dateStamp>
+		<gco:Date>2013-07-01</gco:Date>
+	</dateStamp>
+	<metadataStandardName>
+		<gco:CharacterString>ISO 19139 Geographic Information - Metadata - Implementation Specification</gco:CharacterString>
+	</metadataStandardName>
+	<metadataStandardVersion>
+		<gco:CharacterString>2007</gco:CharacterString>
+	</metadataStandardVersion>
+	<identificationInfo>
+		<MD_DataIdentification>
+			<citation>
+				<CI_Citation>
+					<title>
+						<gco:CharacterString>LandScan Global 2012</gco:CharacterString>
+					</title>
+					<date>
+						<CI_Date>
+							<date>
+								<gco:Date>2013-07-01</gco:Date>
+							</date>
+							<dateType>
+								<CI_DateTypeCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#CI_DateTypeCode" codeListValue="publication" codeSpace="ISOTC211/19115">publication</CI_DateTypeCode>
+							</dateType>
+						</CI_Date>
+					</date>
+					<citedResponsibleParty>
+						<CI_ResponsibleParty>
+							<organisationName>
+								<gco:CharacterString>Human Geography, Geospatial Science and Human Security Division, Oak Ridge National Laboratory</gco:CharacterString>
+							</organisationName>
+							<role>
+								<CI_RoleCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#CI_RoleCode" codeListValue="originator" codeSpace="ISOTC211/19115">originator</CI_RoleCode>
+							</role>
+						</CI_ResponsibleParty>
+					</citedResponsibleParty>
+					<presentationForm>
+						<CI_PresentationFormCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#CI_PresentationFormCode" codeListValue="mapDigital" codeSpace="ISOTC211/19115">mapDigital</CI_PresentationFormCode>
+					</presentationForm>
+					<series>
+						<CI_Series>
+							<name>
+								<gco:CharacterString>LandScan Global Population Database</gco:CharacterString>
+							</name>
+							<issueIdentification>
+								<gco:CharacterString>LandScan Global 2012</gco:CharacterString>
+							</issueIdentification>
+						</CI_Series>
+					</series>
+					<otherCitationDetails>
+						<gco:CharacterString>https://doi.org/10.48690/1524215</gco:CharacterString>
+					</otherCitationDetails>
+				</CI_Citation>
+			</citation>
+			<abstract>
+				<gco:CharacterString>Using an innovative approach that combines Geographic Information Science, remote sensing technology, and machine learning algorithms, ORNL’s LandScan is the community standard for global population distribution. At 30 arc-second (approximately 1 km) resolution, LandScan is the finest resolution global population distribution data available representing an “ambient population” (average over 24 hours). The LandScan algorithm, an R&amp;D 100 Award Winner, uses spatial data, high-resolution imagery exploitation, and a multi-variable dasymetric modeling approach to disaggregate census counts within an administrative boundary. LandScan population data are spatially explicit - unlike tabular Census data. Since no single population distribution model can account for the differences in spatial data availability, quality, scale, and accuracy as well as the differences in cultural settlement practices, LandScan population distribution models are tailored to match the data conditions and geographical nature of each individual country and region. By modeling an ambient population, LandScan Global captures the full potential activity space of people throughout the course of the day and night rather than just a residential location.</gco:CharacterString>
+			</abstract>
+			<purpose>
+				<gco:CharacterString>LandScan Global was developed on behalf of the U.S. federal government and is used for rapid consequence and risk assessment as well as emergency planning and management.</gco:CharacterString>
+			</purpose>
+			<credit>
+				<gco:CharacterString>Human Geography, Geospatial Science and Human Security Division, Oak Ridge National Laboratory; US DOD</gco:CharacterString>
+			</credit>
+			<status>
+				<MD_ProgressCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#MD_ProgressCode" codeListValue="completed" codeSpace="ISOTC211/19115">completed</MD_ProgressCode>
+			</status>
+			<pointOfContact>
+				<CI_ResponsibleParty>
+					<organisationName>
+						<gco:CharacterString>Human Geography, Geospatial Science and Human Security Division, Oak Ridge National Laboratory</gco:CharacterString>
+					</organisationName>
+					<contactInfo>
+						<CI_Contact>
+							<address>
+								<CI_Address>
+									<electronicMailAddress>
+										<gco:CharacterString>landscan@ornl.gov</gco:CharacterString>
+									</electronicMailAddress>
+								</CI_Address>
+							</address>
+						</CI_Contact>
+					</contactInfo>
+					<role>
+						<CI_RoleCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#CI_RoleCode" codeListValue="pointOfContact" codeSpace="ISOTC211/19115">pointOfContact</CI_RoleCode>
+					</role>
+				</CI_ResponsibleParty>
+			</pointOfContact>
+			<resourceMaintenance>
+				<MD_MaintenanceInformation>
+					<maintenanceAndUpdateFrequency>
+						<MD_MaintenanceFrequencyCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#MD_MaintenanceFrequencyCode" codeListValue="annually" codeSpace="ISOTC211/19115">annually</MD_MaintenanceFrequencyCode>
+					</maintenanceAndUpdateFrequency>
+				</MD_MaintenanceInformation>
+			</resourceMaintenance>
+			<descriptiveKeywords>
+				<MD_Keywords>
+					<keyword>
+						<gco:CharacterString>population</gco:CharacterString>
+					</keyword>
+					<keyword>
+						<gco:CharacterString>population count</gco:CharacterString>
+					</keyword>
+					<keyword>
+						<gco:CharacterString>LandScan</gco:CharacterString>
+					</keyword>
+					<keyword>
+						<gco:CharacterString>global population</gco:CharacterString>
+					</keyword>
+					<type>
+						<MD_KeywordTypeCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#MD_KeywordTypeCode" codeListValue="theme" codeSpace="ISOTC211/19115">theme</MD_KeywordTypeCode>
+					</type>
+				</MD_Keywords>
+			</descriptiveKeywords>
+			<descriptiveKeywords>
+				<MD_Keywords>
+					<keyword>
+						<gco:CharacterString>Global</gco:CharacterString>
+					</keyword>
+					<keyword>
+						<gco:CharacterString>Worldwide</gco:CharacterString>
+					</keyword>
+					<type>
+						<MD_KeywordTypeCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#MD_KeywordTypeCode" codeListValue="place" codeSpace="ISOTC211/19115">place</MD_KeywordTypeCode>
+					</type>
+				</MD_Keywords>
+			</descriptiveKeywords>
+			<language>
+				<LanguageCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#LanguageCode" codeListValue="eng">eng</LanguageCode>
+			</language>
+			<extent>
+				<EX_Extent>
+					<geographicElement>
+						<EX_GeographicBoundingBox>
+							<westBoundLongitude>
+								<gco:Decimal>-180</gco:Decimal>
+							</westBoundLongitude>
+							<eastBoundLongitude>
+								<gco:Decimal>180</gco:Decimal>
+							</eastBoundLongitude>
+							<southBoundLatitude>
+								<gco:Decimal>-90</gco:Decimal>
+							</southBoundLatitude>
+							<northBoundLatitude>
+								<gco:Decimal>90</gco:Decimal>
+							</northBoundLatitude>
+						</EX_GeographicBoundingBox>
+					</geographicElement>
+				</EX_Extent>
+			</extent>
+			<extent>
+				<EX_Extent>
+					<description>
+						<gco:CharacterString>ground condition</gco:CharacterString>
+					</description>
+					<temporalElement>
+						<EX_TemporalExtent>
+							<extent>
+								<gml:TimeInstant gml:id="_f8338a9663ce80dca34c693f139a7472">
+									<gml:timePosition>2012-07-01</gml:timePosition>
+								</gml:TimeInstant>
+							</extent>
+						</EX_TemporalExtent>
+					</temporalElement>
+				</EX_Extent>
+			</extent>
+			<supplementalInformation>
+				<gco:CharacterString>None</gco:CharacterString>
+			</supplementalInformation>
+		</MD_DataIdentification>
+	</identificationInfo>
+	<dataQualityInfo>
+		<DQ_DataQuality>
+			<scope>
+				<DQ_Scope>
+					<level>
+						<MD_ScopeCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#MD_ScopeCode" codeListValue="dataset" codeSpace="ISOTC211/19115">dataset</MD_ScopeCode>
+					</level>
+				</DQ_Scope>
+			</scope>
+			<lineage>
+				<LI_Lineage>
+					<source>
+						<LI_Source>
+							<sourceCitation>
+								<CI_Citation>
+									<title>
+										<gco:CharacterString>Multiple Input Datasets</gco:CharacterString>
+									</title>
+									<date gco:nilReason="unknown"></date>
+									<citedResponsibleParty>
+										<CI_ResponsibleParty>
+											<organisationName>
+												<gco:CharacterString>National Geospatial-Intelligence Agency (NGA)</gco:CharacterString>
+											</organisationName>
+											<role>
+												<CI_RoleCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#CI_RoleCode" codeListValue="originator" codeSpace="ISOTC211/19115">originator</CI_RoleCode>
+											</role>
+										</CI_ResponsibleParty>
+									</citedResponsibleParty>
+								</CI_Citation>
+							</sourceCitation>
+						</LI_Source>
+					</source>
+					<source>
+						<LI_Source>
+							<sourceCitation>
+								<CI_Citation>
+									<title>
+										<gco:CharacterString>CIA World Factbook</gco:CharacterString>
+									</title>
+									<date gco:nilReason="unknown"></date>
+									<citedResponsibleParty>
+										<CI_ResponsibleParty>
+											<organisationName>
+												<gco:CharacterString>Central Intelligence Agency</gco:CharacterString>
+											</organisationName>
+											<role>
+												<CI_RoleCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#CI_RoleCode" codeListValue="originator" codeSpace="ISOTC211/19115">originator</CI_RoleCode>
+											</role>
+										</CI_ResponsibleParty>
+									</citedResponsibleParty>
+								</CI_Citation>
+							</sourceCitation>
+						</LI_Source>
+					</source>
+					<source>
+						<LI_Source>
+							<sourceCitation>
+								<CI_Citation>
+									<title>
+										<gco:CharacterString>Administrative boundaries for some selected countries: The Global Administrative Unit Layers (GAUL) dataset, implemented by FAO within the EC FAO Food Security for Action Programme</gco:CharacterString>
+									</title>
+									<date gco:nilReason="unknown"></date>
+									<citedResponsibleParty>
+										<CI_ResponsibleParty>
+											<organisationName>
+												<gco:CharacterString>Global Administrative Unit Layers (GAUL)</gco:CharacterString>
+											</organisationName>
+											<role>
+												<CI_RoleCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#CI_RoleCode" codeListValue="originator" codeSpace="ISOTC211/19115">originator</CI_RoleCode>
+											</role>
+										</CI_ResponsibleParty>
+									</citedResponsibleParty>
+								</CI_Citation>
+							</sourceCitation>
+						</LI_Source>
+					</source>
+					<source>
+						<LI_Source>
+							<sourceCitation>
+								<CI_Citation>
+									<title>
+										<gco:CharacterString>Large Scale International Boundaries (LSIB)</gco:CharacterString>
+									</title>
+									<date gco:nilReason="unknown"></date>
+									<citedResponsibleParty>
+										<CI_ResponsibleParty>
+											<organisationName>
+												<gco:CharacterString>Office of the Geographer, U.S. Department of State</gco:CharacterString>
+											</organisationName>
+											<role>
+												<CI_RoleCode codeList="http://www.isotc211.org/2005/resources/Codelist/gmxCodelists.xml#CI_RoleCode" codeListValue="originator" codeSpace="ISOTC211/19115">originator</CI_RoleCode>
+											</role>
+										</CI_ResponsibleParty>
+									</citedResponsibleParty>
+								</CI_Citation>
+							</sourceCitation>
+						</LI_Source>
+					</source>
+				</LI_Lineage>
+			</lineage>
+		</DQ_DataQuality>
+	</dataQualityInfo>
+</MD_Metadata>
