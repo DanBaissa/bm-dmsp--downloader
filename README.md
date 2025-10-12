@@ -36,13 +36,21 @@ python data_sampler.py \
 1. Downsamples LandScan 2012, masks Antarctica / < -60° latitudes, and samples `--samples-per-bin` points per integer log-population bin.
 2. Writes the sampled table (including the assigned acquisition dates) to `sampled_locations.csv` so you can inspect or reuse it.
 3. Uses the CSV to download BM tiles via NASA CMR, extracts 1000×1000 GeoTIFF patches, and saves them under `Raw_NL_Data/BM data/`.
-4. Finds matching DMSP scenes on the public S3 bucket, reprojects them onto each BM grid, and stores the best-quality patches in `Raw_NL_Data/DMSP data/`.
-5. Emits `Raw_NL_Data/bm_dmsp_pairs.csv`, a manifest describing every BM/DMSP pair that was successfully created.
+4. Finds matching DMSP scenes on the public S3 bucket, reprojects them onto each BM grid (so the extents align exactly), and stores the best-correlated patch in `Raw_NL_Data/DMSP data/`.
+5. Emits `Raw_NL_Data/bm_dmsp_pairs.csv`, a manifest describing every BM/DMSP pair, including the DMSP satellite (`F-number`) and the correlation score used to pick the best match.
 
 If you already have a CSV of locations (with `Longitude`, `Latitude`, and `date` columns), skip the sampling step and feed it to the downloader:
 
 ```bash
 python data_sampler.py --skip-sampling --locations-csv my_locations.csv
 ```
+
+To focus sampling on one or two countries instead of the entire world, supply the `--countries` flag:
+
+```bash
+python data_sampler.py --countries "United States" Canada
+```
+
+The script will infer the appropriate attribute column from `Data/World_Countries/World_Countries_Generalized.shp`, but you can override it with `--country-column` if needed.
 
 All command-line options can be viewed with `python data_sampler.py --help`.

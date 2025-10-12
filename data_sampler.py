@@ -9,7 +9,7 @@ import random
 import re
 import shutil
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import List, Sequence
 
 import boto3
 from botocore import UNSIGNED
@@ -51,6 +51,27 @@ DEFAULT_LOCATIONS_CSV = Path("sampled_locations.csv")
 DEFAULT_MANIFEST = Path("Raw_NL_Data/bm_dmsp_pairs.csv")
 
 
+def infer_country_column(gdf: gpd.GeoDataFrame, country_column: str | None = None) -> str:
+    if country_column and country_column in gdf.columns:
+        return country_column
+    preferred = [
+        "COUNTRY",
+        "COUNTRY_NA",
+        "NAME",
+        "NAME_EN",
+        "ADMIN",
+        "CNTRY_NAME",
+        "SOVEREIGNT",
+    ]
+    for candidate in preferred:
+        if candidate in gdf.columns:
+            return candidate
+    object_columns = [col for col in gdf.columns if gdf[col].dtype == object]
+    if not object_columns:
+        raise ValueError("Unable to infer country column from shapefile")
+    return object_columns[0]
+
+
 def load_nasa_token() -> str:
     token = os.getenv(NASA_TOKEN_ENV)
     if not token:
@@ -67,6 +88,8 @@ def sample_landscan_population(
     min_valid_lat: float = -60.0,
     plots_dir: Path | None = PLOTS_DIR,
     output_csv: Path | None = DEFAULT_LOCATIONS_CSV,
+    countries: Sequence[str] | None = None,
+    country_column: str | None = None,
 ) -> pd.DataFrame:
     """Downsample LandScan, balance by log population bins, and optionally persist a CSV."""
     if not LANDSCAN_RASTER.exists():
@@ -96,9 +119,9 @@ def sample_landscan_population(
         array = np.where(array == nodata, np.nan, array)
 
     LOGGER.info("Masking Antarctica and southern polar regions")
-    gdf = gpd.read_file(COUNTRIES_SHP)
+    gdf = gpd.read_file(COUNTRIES_SHP).copy()
     antarctica = gdf[gdf.get("FID") == 8]
-    mask = rasterize(
+    antarctica_mask = rasterize(
         [(geom, 1) for geom in antarctica.geometry],
         out_shape=array.shape,
         transform=downsampled_transform,
@@ -106,8 +129,33 @@ def sample_landscan_population(
         dtype="uint8",
     )
 
+    include_mask = None
+    if countries:
+        column_name = infer_country_column(gdf, country_column)
+        target = {c.strip().lower() for c in countries}
+        gdf["__country_name"] = gdf[column_name].astype(str).str.strip().str.lower()
+        selected = gdf[gdf["__country_name"].isin(target)]
+        if selected.empty:
+            raise ValueError(
+                "None of the requested countries were found in the shapefile. "
+                f"Requested: {sorted(target)}"
+            )
+        LOGGER.info(
+            "Restricting sampling to %s", ", ".join(sorted(selected[column_name].unique()))
+        )
+        include_mask = rasterize(
+            [(geom, 1) for geom in selected.geometry],
+            out_shape=array.shape,
+            transform=downsampled_transform,
+            fill=0,
+            dtype="uint8",
+        )
+        gdf = gdf.drop(columns=["__country_name"], errors="ignore")
+
     lat_mask = np.repeat(ys[:, np.newaxis], array.shape[1], axis=1)
-    combined_mask = (mask == 1) | (lat_mask < min_valid_lat)
+    combined_mask = (antarctica_mask == 1) | (lat_mask < min_valid_lat)
+    if include_mask is not None:
+        combined_mask |= include_mask == 0
     array = np.where(combined_mask, np.nan, array)
 
     log_array = np.log1p(array)
@@ -395,15 +443,6 @@ def safe_download(s3, bucket: str, key: str, outpath: Path, max_retries: int = 5
     return False
 
 
-def group_by_f_number(file_keys: Iterable[tuple[str, None]]) -> dict[str, List[tuple[str, None]]]:
-    groups: dict[str, List[tuple[str, None]]] = {}
-    for vis_key, _ in file_keys:
-        base = os.path.basename(vis_key)
-        f_number = base.split("_")[0] if "_" in base else base[:3]
-        groups.setdefault(f_number, []).append((vis_key, None))
-    return groups
-
-
 def reproject_to_bm_grid(src_path: Path, bm_profile: dict) -> np.ndarray:
     with rasterio.open(src_path) as src:
         src_data = src.read(1).astype(np.float32)
@@ -423,7 +462,21 @@ def reproject_to_bm_grid(src_path: Path, bm_profile: dict) -> np.ndarray:
     return dst
 
 
-def process_bm_patch_for_best_fnumber(
+def compute_patch_correlation(bm_patch: np.ndarray, dmsp_patch: np.ndarray) -> float | None:
+    mask = (~np.isnan(bm_patch)) & (~np.isnan(dmsp_patch))
+    if mask.sum() < 2:
+        return None
+    bm_vals = bm_patch[mask]
+    dmsp_vals = dmsp_patch[mask]
+    if np.std(bm_vals) == 0 or np.std(dmsp_vals) == 0:
+        return None
+    corr = np.corrcoef(bm_vals, dmsp_vals)[0, 1]
+    if np.isnan(corr):
+        return None
+    return float(corr)
+
+
+def select_best_dmsp_match(
     bm_patch_path: Path,
     file_keys: Sequence[tuple[str, None]],
     s3,
@@ -432,55 +485,75 @@ def process_bm_patch_for_best_fnumber(
     dmsp_out_dir: Path,
     min_valid_fraction: float = 0.10,
 ) -> List[Path]:
-    saved_paths: List[Path] = []
     bm_patch_name = bm_patch_path.name
     with rasterio.open(bm_patch_path) as bm_src:
         bm_profile = bm_src.profile.copy()
         bm_shape = (bm_src.height, bm_src.width)
+        bm_patch = bm_src.read(1).astype(np.float32)
+        bm_patch[bm_patch < 0] = np.nan
 
-    for f_number, scene_keys in group_by_f_number(file_keys).items():
-        best_valid_pixels = 0
-        best_vis_file: Path | None = None
-        best_vis_patch: np.ndarray | None = None
-        for vis_key, _ in scene_keys:
-            vis_file = download_dir / os.path.basename(vis_key)
-            if not vis_file.exists():
-                LOGGER.info("Downloading %s", vis_key)
-                if not safe_download(s3, bucket_name, vis_key, vis_file):
-                    continue
-            try:
-                vis_patch = reproject_to_bm_grid(vis_file, bm_profile)
-            except Exception as exc:  # pragma: no cover - reprojection failure
-                LOGGER.warning("Error processing %s: %s", vis_file, exc)
+    total_pixels = bm_shape[0] * bm_shape[1]
+    best_corr = None
+    best_vis_patch: np.ndarray | None = None
+    best_vis_file: Path | None = None
+    best_valid_fraction = 0.0
+    best_f_number = ""
+
+    for vis_key, _ in file_keys:
+        base = os.path.basename(vis_key)
+        f_number = base.split("_")[0] if "_" in base else base[:3]
+        vis_file = download_dir / base
+        if not vis_file.exists():
+            LOGGER.info("Downloading %s", vis_key)
+            if not safe_download(s3, bucket_name, vis_key, vis_file):
                 continue
-            valid_pixels = np.sum(~np.isnan(vis_patch))
-            median_val = float(np.nanmedian(vis_patch)) if valid_pixels > 0 else 0.0
-            if valid_pixels > best_valid_pixels and median_val > 1:
-                best_valid_pixels = valid_pixels
-                best_vis_file = vis_file
-                best_vis_patch = vis_patch
-        if best_vis_file is None or best_vis_patch is None:
-            LOGGER.info("No good patch found for %s in %s", f_number, bm_patch_name)
+        try:
+            vis_patch = reproject_to_bm_grid(vis_file, bm_profile)
+        except Exception as exc:  # pragma: no cover - reprojection failure
+            LOGGER.warning("Error processing %s: %s", vis_file, exc)
             continue
-        valid_fraction = best_valid_pixels / (bm_shape[0] * bm_shape[1])
+        valid_pixels = np.sum(~np.isnan(vis_patch))
+        valid_fraction = valid_pixels / total_pixels if total_pixels else 0
         if valid_fraction < min_valid_fraction:
-            LOGGER.info(
-                "Skipping %s for %s: only %.2f%% valid pixels",
-                f_number,
+            LOGGER.debug(
+                "Skipping %s for %s due to low coverage (%.2f%%)",
+                base,
                 bm_patch_name,
                 valid_fraction * 100,
             )
             continue
-        out_fname = f"{f_number}_{best_vis_file.stem}_match_{bm_patch_name.replace('.tif', '')}.tif"
-        out_path = dmsp_out_dir / out_fname
-        out_profile = bm_profile.copy()
-        out_profile.update({"dtype": "float32", "count": 1, "nodata": np.nan})
-        dmsp_out_dir.mkdir(parents=True, exist_ok=True)
-        with rasterio.open(out_path, "w", **out_profile) as dst:
-            dst.write(best_vis_patch.astype(np.float32), 1)
-        LOGGER.info("Saved DMSP patch %s", out_path)
-        saved_paths.append(out_path)
-    return saved_paths
+        corr = compute_patch_correlation(bm_patch, vis_patch)
+        if corr is None:
+            LOGGER.debug("Unable to compute correlation for %s", base)
+            continue
+        if best_corr is None or corr > best_corr:
+            best_corr = corr
+            best_vis_patch = vis_patch
+            best_vis_file = vis_file
+            best_valid_fraction = valid_fraction
+            best_f_number = f_number
+
+    if best_vis_file is None or best_vis_patch is None or best_corr is None:
+        LOGGER.info("No DMSP scene correlated well with %s", bm_patch_name)
+        return []
+
+    out_fname = (
+        f"{best_f_number}_{best_vis_file.stem}_corr_{best_corr:.3f}_"
+        f"match_{bm_patch_name.replace('.tif', '')}.tif"
+    )
+    out_path = dmsp_out_dir / out_fname
+    out_profile = bm_profile.copy()
+    out_profile.update({"dtype": "float32", "count": 1, "nodata": np.nan})
+    dmsp_out_dir.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(out_path, "w", **out_profile) as dst:
+        dst.write(best_vis_patch.astype(np.float32), 1)
+    LOGGER.info(
+        "Saved DMSP patch %s (correlation %.3f, %.1f%% valid)",
+        out_path,
+        best_corr,
+        best_valid_fraction * 100,
+    )
+    return [out_path]
 
 
 def parallel_process_bm_patch(
@@ -505,7 +578,7 @@ def parallel_process_bm_patch(
     if not file_keys:
         LOGGER.info("No DMSP scenes found for %s", bm_patch_path.name)
         return []
-    saved = process_bm_patch_for_best_fnumber(
+    saved = select_best_dmsp_match(
         bm_patch_path,
         file_keys,
         s3,
@@ -552,18 +625,21 @@ def download_dmsp_matches(
 def create_pair_manifest(bm_dir: Path, dmsp_dir: Path, manifest_path: Path) -> pd.DataFrame:
     bm_files = {path.stem: path for path in bm_dir.glob("*.tif")}
     rows = []
-    pattern = re.compile(r"_match_(BM_patch_.+)\.tif$")
+    pattern = re.compile(
+        r"^(?P<f_number>F\d+)_.+_corr_(?P<corr>-?\d+(?:\.\d+)?)_match_(?P<bm_key>BM_patch_.+)$"
+    )
     for dmsp_path in dmsp_dir.glob("*.tif"):
-        match = pattern.search(dmsp_path.name)
+        match = pattern.match(dmsp_path.stem)
         if not match:
             continue
-        bm_key = match.group(1)
+        bm_key = match.group("bm_key")
         if bm_key in bm_files:
             rows.append(
                 {
                     "bm_patch": str(bm_files[bm_key]),
                     "dmsp_patch": str(dmsp_path),
-                    "f_number": dmsp_path.name.split("_")[0],
+                    "f_number": match.group("f_number"),
+                    "correlation": float(match.group("corr")),
                 }
             )
     manifest = pd.DataFrame(rows)
@@ -587,6 +663,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Use the existing locations CSV instead of regenerating samples",
     )
     parser.add_argument(
+        "--countries",
+        nargs="+",
+        help="Optional list of country names to constrain LandScan sampling",
+    )
+    parser.add_argument(
+        "--country-column",
+        type=str,
+        help="Shapefile column to use when matching country names",
+    )
+    parser.add_argument(
         "--collection-id",
         type=str,
         default=DEFAULT_COLLECTION_ID,
@@ -603,11 +689,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise FileNotFoundError(f"--skip-sampling provided but {args.locations_csv} does not exist")
 
     if args.skip_sampling:
+        if args.countries:
+            LOGGER.warning("--countries ignored because --skip-sampling was provided")
         df = pd.read_csv(args.locations_csv)
     else:
         df = sample_landscan_population(
             samples_per_bin=args.samples_per_bin,
             output_csv=args.locations_csv,
+            countries=args.countries,
+            country_column=args.country_column,
         )
 
     dmsp_dates = list_dmsp_dates()
