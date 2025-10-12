@@ -8,31 +8,27 @@ Original file is located at
 """
 
 # Commented out IPython magic to ensure Python compatibility.
-from google.colab import userdata
-
-# Get token
-token = userdata.get('Colab_token')
-NASA_Token = userdata.get('NASA_Token')
-
-# Clone
-!git clone https://github.com/DanBaissa/bm-dmsp-pretraining-pipeline
-
-# Change into the directory
-# %cd bm-dmsp-pretraining-pipeline
-
-# Set remote to use token (for pushing)
-!git remote set-url origin https://{token}@github.com/DanBaissa/bm-dmsp-pretraining-pipeline.git
-
-# Set Git config (only needs to be done once per session)
-!git config --global user.email "danbaissa@gmail.com"
-!git config --global user.name "Dan Baissa"
-
 import os
-# os.chdir('bm-dmsp-pretraining-pipeline')
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
+NASA_Token = os.getenv("NASA_TOKEN")
+
+if not NASA_Token:
+    raise RuntimeError(
+        "NASA_TOKEN environment variable is not set. "
+        "Create a .env file (see .env.example) with your NASA Earthdata token before running downloads."
+    )
+
+# Optional: print current working directory for debugging
 print(os.getcwd())
 
-# !pip install rasterio geopandas shapely
-!pip install rasterio boto3 tqdm
 
 import os
 import re
