@@ -841,6 +841,36 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     LOGGER.info("Downloaded %s BM patches and %s DMSP patches", len(bm_patches), len(dmsp_patches))
+    manifest = create_pair_manifest(BM_OUTPUT_DIR, DMSP_OUTPUT_DIR, args.manifest)
+
+    expected_bm: set[str] = set()
+    expected_dmsp: set[str] = set()
+    if "bm_patch" in manifest.columns:
+        expected_bm = {Path(path).name for path in manifest["bm_patch"].dropna()}
+    if "dmsp_patch" in manifest.columns:
+        expected_dmsp = {Path(path).name for path in manifest["dmsp_patch"].dropna()}
+
+    bm_removed = 0
+    if BM_OUTPUT_DIR.exists():
+        for bm_path in BM_OUTPUT_DIR.glob("*.tif"):
+            if bm_path.name not in expected_bm:
+                bm_path.unlink(missing_ok=True)
+                bm_removed += 1
+
+    dmsp_removed = 0
+    if DMSP_OUTPUT_DIR.exists():
+        for dmsp_path in DMSP_OUTPUT_DIR.glob("*.tif"):
+            if dmsp_path.name not in expected_dmsp:
+                dmsp_path.unlink(missing_ok=True)
+                dmsp_removed += 1
+
+    if bm_removed or dmsp_removed:
+        LOGGER.info(
+            "Removed %s unmatched BM rasters and %s unmatched DMSP rasters", bm_removed, dmsp_removed
+        )
+    else:
+        LOGGER.info("No unmatched BM or DMSP rasters were removed")
+
     create_pair_manifest(BM_OUTPUT_DIR, DMSP_OUTPUT_DIR, args.manifest)
 
 
