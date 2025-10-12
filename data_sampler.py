@@ -23,9 +23,11 @@ import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
+from rasterio.io import MemoryFile
+from rasterio.merge import merge as rio_merge
 from rasterio.transform import from_bounds as rio_from_bounds
-from rasterio.windows import from_bounds
 from rasterio.warp import reproject, Resampling as WarpResampling
+import rasterio.windows
 import requests
 
 try:
@@ -49,6 +51,8 @@ DMSP_OUTPUT_DIR = Path("Raw_NL_Data/DMSP data")
 PLOTS_DIR = Path("plots")
 DEFAULT_LOCATIONS_CSV = Path("sampled_locations.csv")
 DEFAULT_MANIFEST = Path("Raw_NL_Data/bm_dmsp_pairs.csv")
+NOMINAL_DEG_PER_PX = 15.0 / 3600.0
+BM_DATASET_PATH = "/HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields/Gap_Filled_DNB_BRDF-Corrected_NTL"
 
 
 def infer_country_column(gdf: gpd.GeoDataFrame, country_column: str | None = None) -> str:
@@ -248,18 +252,14 @@ def assign_random_dates(df: pd.DataFrame, dmsp_dates: Sequence[str], seed: int =
     return df_with_dates
 
 
-def get_patch_bbox(lon: float, lat: float, patch_size_pix: int, tif_res_deg: float) -> List[float]:
-    half_deg = (patch_size_pix * tif_res_deg) / 2
+def get_patch_bbox(
+    lon: float,
+    lat: float,
+    patch_size_pix: int,
+    pixel_size_deg: float = NOMINAL_DEG_PER_PX,
+) -> List[float]:
+    half_deg = (patch_size_pix * pixel_size_deg) / 2
     return [lon - half_deg, lat - half_deg, lon + half_deg, lat + half_deg]
-
-
-def enforce_patch_size(patch: np.ndarray, patch_size_pix: int) -> np.ndarray:
-    patch = patch[:patch_size_pix, :patch_size_pix]
-    pad_h = max(0, patch_size_pix - patch.shape[0])
-    pad_w = max(0, patch_size_pix - patch.shape[1])
-    if pad_h > 0 or pad_w > 0:
-        patch = np.pad(patch, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0)
-    return patch
 
 
 def search_nasa_cmr(collection_id: str, date_str: str, bbox: Sequence[float]) -> List[str]:
@@ -281,23 +281,140 @@ def search_nasa_cmr(collection_id: str, date_str: str, bbox: Sequence[float]) ->
     return h5_links
 
 
-def extract_patch_from_geotiff(tif_path: Path, lon: float, lat: float, patch_size_pix: int) -> tuple[np.ndarray, dict]:
-    with rasterio.open(tif_path) as src:
-        tif_res_deg = src.transform[0]
-        bbox = get_patch_bbox(lon, lat, patch_size_pix, tif_res_deg)
-        window = from_bounds(*bbox, src.transform)
-        patch = src.read(1, window=window)
-        patch = enforce_patch_size(patch, patch_size_pix)
-        patch_transform = src.window_transform(window)
-        patch_meta = src.meta.copy()
-        patch_meta.update(
-            {
-                "height": patch_size_pix,
-                "width": patch_size_pix,
-                "transform": patch_transform,
-            }
-        )
-    return patch, patch_meta
+def h5_to_geotiff(h5_path: Path, tile_shapefile_gdf: gpd.GeoDataFrame) -> Path:
+    """Convert a Black Marble granule HDF5 file into a temporary GeoTIFF."""
+
+    with h5py.File(h5_path, "r") as h5_file:
+        if BM_DATASET_PATH not in h5_file:
+            raise RuntimeError(f"Dataset not found in {h5_path.name}")
+        dataset = h5_file[BM_DATASET_PATH]
+        data = dataset[...].astype(np.float32)
+
+        for attr in ("_FillValue", "missing_value", "MissingValue"):
+            value = dataset.attrs.get(attr)
+            if value is None:
+                continue
+            value_arr = np.asarray(value, dtype=np.float32)
+            if value_arr.size == 0:
+                continue
+            data = np.where(np.isin(data, value_arr), np.nan, data)
+
+        data[data < 0] = np.nan
+
+    tile_match = re.search(r"h\d{2}v\d{2}", h5_path.name)
+    if not tile_match:
+        raise RuntimeError(f"Could not determine tile ID for {h5_path.name}")
+    tile_id = tile_match.group()
+    bounds_row = tile_shapefile_gdf[tile_shapefile_gdf["TileID"] == tile_id]
+    if bounds_row.empty:
+        raise RuntimeError(f"Tile ID {tile_id} not found in shapefile")
+    left, bottom, right, top = bounds_row.total_bounds
+
+    tif_path = h5_path.with_suffix(".tif")
+    with rasterio.open(
+        tif_path,
+        "w",
+        driver="GTiff",
+        height=data.shape[0],
+        width=data.shape[1],
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=rio_from_bounds(left, bottom, right, top, data.shape[1], data.shape[0]),
+        nodata=np.nan,
+    ) as dst:
+        dst.write(data, 1)
+
+    return tif_path
+
+
+def build_bm_mosaic_for_bbox(
+    h5_paths: List[Path],
+    tile_shapefile_gdf: gpd.GeoDataFrame,
+) -> tuple[np.ndarray, rasterio.Affine, dict]:
+    """Mosaic all tiles intersecting the target bbox into a single raster."""
+
+    tif_paths: List[Path] = []
+    try:
+        for h5_path in h5_paths:
+            tif_paths.append(h5_to_geotiff(h5_path, tile_shapefile_gdf))
+
+        datasets: List[rasterio.io.DatasetReader] = []
+        try:
+            for tif_path in tif_paths:
+                datasets.append(rasterio.open(tif_path))
+            mosaic, transform = rio_merge(datasets, nodata=np.nan)
+            if mosaic.shape[0] != 1:
+                raise RuntimeError("Expected a single-band mosaic")
+            mosaic_array = mosaic[0].astype(np.float32, copy=False)
+            profile = datasets[0].profile.copy()
+            profile.update(
+                {
+                    "height": mosaic_array.shape[0],
+                    "width": mosaic_array.shape[1],
+                    "transform": transform,
+                    "nodata": np.nan,
+                    "count": 1,
+                    "dtype": "float32",
+                    "crs": "EPSG:4326",
+                }
+            )
+        finally:
+            for dataset in datasets:
+                dataset.close()
+    finally:
+        for tif_path in tif_paths:
+            tif_path.unlink(missing_ok=True)
+
+    return mosaic_array, transform, profile
+
+
+def crop_mosaic_to_bbox(
+    mosaic_array: np.ndarray,
+    mosaic_transform: rasterio.Affine,
+    bbox: Sequence[float],
+    patch_size_pix: int,
+) -> tuple[np.ndarray, rasterio.Affine]:
+    """Crop the mosaic to the requested square bounding box."""
+
+    profile = {
+        "driver": "GTiff",
+        "height": mosaic_array.shape[0],
+        "width": mosaic_array.shape[1],
+        "count": 1,
+        "dtype": "float32",
+        "crs": "EPSG:4326",
+        "transform": mosaic_transform,
+        "nodata": np.nan,
+    }
+
+    with MemoryFile() as memfile:
+        with memfile.open(**profile) as dataset:
+            dataset.write(mosaic_array, 1)
+            window = rasterio.windows.from_bounds(*bbox, transform=dataset.transform)
+            window = window.round_offsets().round_lengths()
+            desired_window = rasterio.windows.Window(
+                col_off=int(round(window.col_off)),
+                row_off=int(round(window.row_off)),
+                width=patch_size_pix,
+                height=patch_size_pix,
+            )
+            full_window = rasterio.windows.Window(0, 0, dataset.width, dataset.height)
+            intersection = desired_window.intersection(full_window)
+            if intersection.width <= 0 or intersection.height <= 0:
+                raise RuntimeError(f"Mosaic does not cover bbox {bbox}")
+            patch = dataset.read(1, window=intersection, boundless=False).astype(np.float32, copy=False)
+
+    cropped = np.full((patch_size_pix, patch_size_pix), np.nan, dtype=np.float32)
+    row_offset = int(round(intersection.row_off - desired_window.row_off))
+    col_offset = int(round(intersection.col_off - desired_window.col_off))
+    cropped[
+        row_offset : row_offset + patch.shape[0],
+        col_offset : col_offset + patch.shape[1],
+    ] = patch
+
+    patch_transform = rasterio.windows.transform(desired_window, profile["transform"])
+    return cropped, patch_transform
 
 
 def process_single_sample(
@@ -313,62 +430,62 @@ def process_single_sample(
     if lat < -60:
         return (f"Skipping Antarctica sample at ({lon:.3f}, {lat:.3f})", None)
 
-    bbox = get_patch_bbox(lon, lat, patch_size_pix, tif_res_deg=0.004)
-    if bbox[1] < -60:
-        bbox[1] = -60
-    if bbox[3] < -60:
+    bbox = get_patch_bbox(lon, lat, patch_size_pix)
+    search_bbox = list(bbox)
+    if search_bbox[1] < -60:
+        search_bbox[1] = -60
+    if search_bbox[3] < -60:
         return (f"Skipping search below -60°S for bbox {bbox}", None)
 
-    urls = search_nasa_cmr(collection_id, date_str, bbox)
+    urls = search_nasa_cmr(collection_id, date_str, search_bbox)
     if not urls:
-        return (f"No Black Marble file found for {date_str} at ({lon:.3f}, {lat:.3f})", None)
+        return (f"No Black Marble granules found for {date_str} at ({lon:.3f}, {lat:.3f})", None)
 
-    h5_url = urls[0]
-    h5_path = temp_folder / os.path.basename(h5_url)
-    if not h5_path.exists():
-        response = requests.get(h5_url, headers={"Authorization": f"Bearer {token}"})
-        response.raise_for_status()
-        h5_path.write_bytes(response.content)
+    sample_temp = temp_folder / f"{lon:.3f}_{lat:.3f}_{date_str.replace('-', '')}"
+    sample_temp.mkdir(parents=True, exist_ok=True)
 
-    tif_path = h5_path.with_suffix(".tif")
-    with h5py.File(h5_path, "r") as f:
-        dataset_path = "/HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields/Gap_Filled_DNB_BRDF-Corrected_NTL"
-        if dataset_path not in f:
-            h5_path.unlink(missing_ok=True)
-            return (f"Dataset not found in {h5_path.name}", None)
-        ntl_data = f[dataset_path][...]
-        tile_match = re.search(r"h\d{2}v\d{2}", h5_path.name)
-        if not tile_match:
-            h5_path.unlink(missing_ok=True)
-            return (f"Could not determine tile ID for {h5_path.name}", None)
-        tile_id = tile_match.group()
-        bounds_row = tile_shapefile[tile_shapefile["TileID"] == tile_id]
-        if bounds_row.empty:
-            h5_path.unlink(missing_ok=True)
-            return (f"Tile ID {tile_id} not found in shapefile", None)
-        left, bottom, right, top = bounds_row.total_bounds
+    h5_paths: List[Path] = []
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        for url in urls:
+            h5_path = sample_temp / os.path.basename(url)
+            if not h5_path.exists():
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()
+                h5_path.write_bytes(response.content)
+            h5_paths.append(h5_path)
 
-    with rasterio.open(
-        tif_path,
-        "w",
-        driver="GTiff",
-        height=ntl_data.shape[0],
-        width=ntl_data.shape[1],
-        count=1,
-        dtype=ntl_data.dtype,
-        crs="EPSG:4326",
-        transform=rio_from_bounds(left, bottom, right, top, ntl_data.shape[1], ntl_data.shape[0]),
-    ) as dst:
-        dst.write(ntl_data, 1)
+        mosaic_array, mosaic_transform, mosaic_profile = build_bm_mosaic_for_bbox(
+            h5_paths, tile_shapefile
+        )
+        patch, patch_transform = crop_mosaic_to_bbox(
+            mosaic_array, mosaic_transform, bbox, patch_size_pix
+        )
 
-    patch, patch_meta = extract_patch_from_geotiff(tif_path, lon, lat, patch_size_pix)
-    out_path = output_folder / f"BM_patch_{date_str}_{lon:.3f}_{lat:.3f}.tif"
-    with rasterio.open(out_path, "w", **patch_meta) as dst:
-        dst.write(patch, 1)
+        out_path = output_folder / f"BM_patch_{date_str}_{lon:.3f}_{lat:.3f}.tif"
+        profile = mosaic_profile.copy()
+        profile.update(
+            {
+                "height": patch.shape[0],
+                "width": patch.shape[1],
+                "transform": patch_transform,
+                "dtype": "float32",
+                "nodata": np.nan,
+            }
+        )
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.write(patch, 1)
+    except Exception as exc:  # pragma: no cover - network/file errors
+        LOGGER.error(
+            "Error processing sample %s (%s, %s): %s", date_str, lon, lat, exc, exc_info=True
+        )
+        return (f"Failed to save patch for {date_str} at ({lon:.3f}, {lat:.3f}): {exc}", None)
+    finally:
+        for path in h5_paths:
+            path.unlink(missing_ok=True)
+        shutil.rmtree(sample_temp, ignore_errors=True)
 
-    h5_path.unlink(missing_ok=True)
-    tif_path.unlink(missing_ok=True)
-    return (f"Saved patch: {out_path}", out_path)
+    return (f"Saved mosaic patch: {out_path}", out_path)
 
 
 def process_samples_parallel(
