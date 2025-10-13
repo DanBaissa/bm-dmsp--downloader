@@ -290,3 +290,28 @@ def test_build_bm_mosaic_skips_missing_tiles(monkeypatch, tmp_path):
             [Path("missing.h5")],
             tile_shapefile_gdf=object(),
         )
+
+
+def test_resolve_cli_path_defaults_with_output_root(tmp_path):
+    output_root = tmp_path / "outputs"
+    default = data_sampler.DEFAULT_MANIFEST
+    resolved = data_sampler.resolve_cli_path(output_root, default, default, default.name)
+    assert resolved == output_root / default.name
+
+
+def test_resolve_cli_path_respects_relative_overrides(tmp_path):
+    output_root = tmp_path / "outputs"
+    custom = Path("nested/output.csv")
+    resolved = data_sampler.resolve_cli_path(
+        output_root, custom, data_sampler.DEFAULT_MANIFEST, data_sampler.DEFAULT_MANIFEST.name
+    )
+    assert resolved == output_root / custom
+
+
+def test_resolve_cli_path_keeps_absolute_paths(tmp_path):
+    output_root = tmp_path / "outputs"
+    absolute = (tmp_path / "explicit.csv").resolve()
+    resolved = data_sampler.resolve_cli_path(
+        output_root, absolute, data_sampler.DEFAULT_MANIFEST, data_sampler.DEFAULT_MANIFEST.name
+    )
+    assert resolved == absolute
