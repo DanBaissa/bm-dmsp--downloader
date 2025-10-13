@@ -25,11 +25,7 @@ This repository contains tooling for downloading and preparing Black Marble DMSP
 The refactored pipeline lives in `data_sampler.py`. It keeps the LandScan-driven sampling so every run produces a population-balanced CSV of candidate locations **and** downloads the paired Black Marble (BM) and DMSP GeoTIFFs at a 1000×1000 pixel resolution.
 
 ```bash
-python data_sampler.py \
-  --patch-size 1000 \
-  --samples-per-bin 200 \
-  --max-workers 4 \
-  --output-folder Raw_NL_Data
+python data_sampler.py --patch-size 1000 --samples-per-bin 200 --max-workers 4 --output-folder Raw_NL_Data --sampling-seed 13492
 ```
 
 Use `--output-folder` to keep every generated artifact—Black Marble rasters, DMSP rasters, plots, CSVs, and manifests—under a
