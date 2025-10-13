@@ -28,16 +28,21 @@ The refactored pipeline lives in `data_sampler.py`. It keeps the LandScan-driven
 python data_sampler.py \
   --patch-size 1000 \
   --samples-per-bin 200 \
-  --max-workers 4
+  --max-workers 4 \
+  --output-folder Raw_NL_Data
 ```
+
+Use `--output-folder` to keep every generated artifact—Black Marble rasters, DMSP rasters, plots, CSVs, and manifests—under a
+single directory. Any other relative output paths you supply (for example, a custom `--locations-csv` or `--manifest`) are
+resolved beneath that root.
 
 ### What the script does
 
 1. Downsamples LandScan 2012, masks Antarctica / < -60° latitudes, and samples `--samples-per-bin` points per integer log-population bin.
-2. Writes the sampled table (including the assigned acquisition dates) to `sampled_locations.csv` so you can inspect or reuse it.
-3. Uses the CSV to download BM tiles via NASA CMR, extracts 1000×1000 GeoTIFF patches, and saves them under `Raw_NL_Data/BM data/`.
-4. Finds matching DMSP scenes on the public S3 bucket, reprojects them onto each BM grid (so the extents align exactly), and stores the best-correlated patch in `Raw_NL_Data/DMSP data/`.
-5. Emits `Raw_NL_Data/bm_dmsp_pairs.csv`, a manifest describing every BM/DMSP pair, including the DMSP satellite (`F-number`) and the correlation score used to pick the best match.
+2. Writes the sampled table (including the assigned acquisition dates) to `sampled_locations.csv` (or the path you choose) so you can inspect or reuse it.
+3. Uses the CSV to download BM tiles via NASA CMR, extracts 1000×1000 GeoTIFF patches, and saves them under `Raw_NL_Data/BM data/` by default (or inside your chosen output folder).
+4. Finds matching DMSP scenes on the public S3 bucket, reprojects them onto each BM grid (so the extents align exactly), and stores the best-correlated patch in `Raw_NL_Data/DMSP data/` (again, relative to your output folder when provided).
+5. Emits `Raw_NL_Data/bm_dmsp_pairs.csv`, a manifest describing every BM/DMSP pair, including the DMSP satellite (`F-number`) and the correlation score used to pick the best match (again defaulting to that path unless you relocate it with `--output-folder`).
 
 If you already have a CSV of locations (with `Longitude`, `Latitude`, and `date` columns), skip the sampling step and feed it to the downloader:
 

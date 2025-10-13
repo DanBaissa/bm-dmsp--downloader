@@ -844,6 +844,22 @@ def create_pair_manifest(bm_dir: Path, dmsp_dir: Path, manifest_path: Path) -> p
     return manifest
 
 
+def resolve_cli_path(
+    output_root: Path | None,
+    candidate: Path,
+    default_value: Path,
+    default_name: str,
+) -> Path:
+    """Resolve a CLI-provided path relative to the optional output root."""
+
+    candidate = candidate.expanduser()
+    if output_root is None or candidate.is_absolute():
+        return candidate
+    if candidate == default_value:
+        return output_root / default_name
+    return output_root / candidate
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download paired BM/DMSP GeoTIFFs")
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE, help="Patch size in pixels")
@@ -851,6 +867,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-workers", type=int, default=4, help="Parallel workers for downloads")
     parser.add_argument("--locations-csv", type=Path, default=DEFAULT_LOCATIONS_CSV, help="CSV of locations to process")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST, help="Output CSV manifest for BM/DMSP pairs")
+    parser.add_argument(
+        "--output-folder",
+        type=Path,
+        help="Root directory where BM, DMSP, plots, and CSV artifacts will be written",
+    )
     parser.add_argument(
         "--skip-sampling",
         action="store_true",
@@ -891,18 +912,40 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = parse_args(argv)
 
-    if args.skip_sampling and not args.locations_csv.exists():
-        raise FileNotFoundError(f"--skip-sampling provided but {args.locations_csv} does not exist")
+    output_root = args.output_folder.expanduser() if args.output_folder else None
+
+    bm_dir = output_root / "BM data" if output_root else BM_OUTPUT_DIR
+    dmsp_dir = output_root / "DMSP data" if output_root else DMSP_OUTPUT_DIR
+    plots_dir = output_root / "plots" if output_root else PLOTS_DIR
+    temp_dir = output_root / "temp_dl" if output_root else Path("temp_dl")
+    dmsp_temp_dir = output_root / "DMSP_Raw_Temp" if output_root else Path("DMSP_Raw_Temp")
+
+    locations_csv = resolve_cli_path(
+        output_root,
+        args.locations_csv,
+        DEFAULT_LOCATIONS_CSV,
+        DEFAULT_LOCATIONS_CSV.name,
+    )
+    manifest_path = resolve_cli_path(
+        output_root,
+        args.manifest,
+        DEFAULT_MANIFEST,
+        DEFAULT_MANIFEST.name,
+    )
+
+    if args.skip_sampling and not locations_csv.exists():
+        raise FileNotFoundError(f"--skip-sampling provided but {locations_csv} does not exist")
 
     if args.skip_sampling:
         if args.countries:
             LOGGER.warning("--countries ignored because --skip-sampling was provided")
-        df = pd.read_csv(args.locations_csv)
+        df = pd.read_csv(locations_csv)
     else:
         df = sample_landscan_population(
             samples_per_bin=args.samples_per_bin,
             random_seed=args.sampling_seed,
-            output_csv=args.locations_csv,
+            plots_dir=plots_dir,
+            output_csv=locations_csv,
             countries=args.countries,
             country_column=args.country_column,
         )
@@ -918,25 +961,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         collection_id=args.collection_id,
         token=token,
         tile_shapefile_path=DEFAULT_TILE_SHAPEFILE,
-        output_folder=BM_OUTPUT_DIR,
-        temp_folder=Path("temp_dl"),
+        output_folder=bm_dir,
+        temp_folder=temp_dir,
         max_workers=args.max_workers,
     )
 
     dmsp_patches = download_dmsp_matches(
         bm_patch_paths=bm_patches,
-        dmsp_out_dir=DMSP_OUTPUT_DIR,
-        temp_dir=Path("DMSP_Raw_Temp"),
+        dmsp_out_dir=dmsp_dir,
+        temp_dir=dmsp_temp_dir,
         max_workers=args.max_workers,
     )
 
     LOGGER.info("Downloaded %s BM patches and %s DMSP patches", len(bm_patches), len(dmsp_patches))
-    manifest = create_pair_manifest(BM_OUTPUT_DIR, DMSP_OUTPUT_DIR, args.manifest)
+    manifest = create_pair_manifest(bm_dir, dmsp_dir, manifest_path)
 
     manifest_df = manifest
-    if args.manifest.exists():
+    if manifest_path.exists():
         try:
-            manifest_df = pd.read_csv(args.manifest)
+            manifest_df = pd.read_csv(manifest_path)
         except pd.errors.EmptyDataError:
             manifest_df = pd.DataFrame()
 
@@ -962,26 +1005,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     yield path
 
     bm_removed = 0
-    if BM_OUTPUT_DIR.exists():
-        for bm_path in iter_rasters(BM_OUTPUT_DIR):
-    expected_bm: set[str] = set()
-    expected_dmsp: set[str] = set()
-    if "bm_patch" in manifest.columns:
-        expected_bm = {Path(path).name for path in manifest["bm_patch"].dropna()}
-    if "dmsp_patch" in manifest.columns:
-        expected_dmsp = {Path(path).name for path in manifest["dmsp_patch"].dropna()}
-
-    bm_removed = 0
-    if BM_OUTPUT_DIR.exists():
-        for bm_path in BM_OUTPUT_DIR.glob("*.tif"):
+    if bm_dir.exists():
+        for bm_path in iter_rasters(bm_dir):
             if bm_path.name not in expected_bm:
                 bm_path.unlink(missing_ok=True)
                 bm_removed += 1
 
     dmsp_removed = 0
-    if DMSP_OUTPUT_DIR.exists():
-        for dmsp_path in iter_rasters(DMSP_OUTPUT_DIR):
-        for dmsp_path in DMSP_OUTPUT_DIR.glob("*.tif"):
+    if dmsp_dir.exists():
+        for dmsp_path in iter_rasters(dmsp_dir):
             if dmsp_path.name not in expected_dmsp:
                 dmsp_path.unlink(missing_ok=True)
                 dmsp_removed += 1
@@ -992,8 +1024,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     else:
         LOGGER.info("No unmatched BM or DMSP rasters were removed")
-
-    create_pair_manifest(BM_OUTPUT_DIR, DMSP_OUTPUT_DIR, args.manifest)
 
 
 if __name__ == "__main__":
