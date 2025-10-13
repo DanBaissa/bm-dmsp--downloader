@@ -4,12 +4,13 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import logging
+import math
 import os
 import random
 import re
 import shutil
 from pathlib import Path
-from typing import List, Sequence
+from typing import Iterable, List, Sequence
 
 import boto3
 from botocore import UNSIGNED
@@ -53,6 +54,10 @@ DEFAULT_LOCATIONS_CSV = Path("sampled_locations.csv")
 DEFAULT_MANIFEST = Path("Raw_NL_Data/bm_dmsp_pairs.csv")
 NOMINAL_DEG_PER_PX = 15.0 / 3600.0
 BM_DATASET_PATH = "/HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields/Gap_Filled_DNB_BRDF-Corrected_NTL"
+
+
+class TileMetadataMissingError(RuntimeError):
+    """Raised when a Black Marble granule cannot be located in the tile index."""
 
 
 def infer_country_column(gdf: gpd.GeoDataFrame, country_column: str | None = None) -> str:
@@ -262,23 +267,75 @@ def get_patch_bbox(
     return [lon - half_deg, lat - half_deg, lon + half_deg, lat + half_deg]
 
 
+def _normalize_bbox(bbox: Sequence[float]) -> List[List[float]]:
+    """Split a bbox into dateline-safe segments for CMR queries."""
+
+    if len(bbox) != 4:
+        raise ValueError("Expected 4 values for bounding box")
+
+    lon1, lat1, lon2, lat2 = bbox
+    min_lon, max_lon = sorted((lon1, lon2))
+    min_lat, max_lat = sorted((lat1, lat2))
+    min_lat = max(-90.0, min_lat)
+    max_lat = min(90.0, max_lat)
+
+    if max_lon - min_lon >= 360:
+        return [[-180.0, min_lat, 180.0, max_lat]]
+
+    def wrap(lon: float) -> float:
+        wrapped = ((lon + 180.0) % 360.0) - 180.0
+        if math.isclose(wrapped, -180.0) and lon > 0:
+            return 180.0
+        return wrapped
+
+    wrapped_min = wrap(min_lon)
+    wrapped_max = wrap(max_lon)
+
+    if wrapped_min <= wrapped_max and -180.0 <= wrapped_min <= 180.0 and -180.0 <= wrapped_max <= 180.0:
+        return [[wrapped_min, min_lat, wrapped_max, max_lat]]
+
+    first = [wrapped_min, min_lat, 180.0, max_lat]
+    second = [-180.0, min_lat, wrapped_max, max_lat]
+    return [first, second]
+
+
 def search_nasa_cmr(collection_id: str, date_str: str, bbox: Sequence[float]) -> List[str]:
-    params = {
-        "collection_concept_id": collection_id,
-        "temporal": f"{date_str}T00:00:00Z,{date_str}T23:59:59Z",
-        "bounding_box": ",".join(map(str, bbox)),
-        "page_size": 50,
-    }
-    response = requests.get("https://cmr.earthdata.nasa.gov/search/granules.json", params=params)
-    response.raise_for_status()
-    h5_links: List[str] = []
-    granules = response.json().get("feed", {}).get("entry", [])
-    for granule in granules:
-        for link in granule.get("links", []):
-            href = link.get("href", "")
-            if href.startswith("https") and href.endswith(".h5"):
-                h5_links.append(href)
-    return h5_links
+    segments = _normalize_bbox(bbox)
+    seen: set[str] = set()
+    results: List[str] = []
+    for segment in segments:
+        params = {
+            "collection_concept_id": collection_id,
+            "temporal": f"{date_str}T00:00:00Z,{date_str}T23:59:59Z",
+            "bounding_box": ",".join(f"{value:.6f}" for value in segment),
+            "page_size": 50,
+        }
+        try:
+            response = requests.get(
+                "https://cmr.earthdata.nasa.gov/search/granules.json",
+                params=params,
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            LOGGER.warning(
+                "CMR query failed for %s with bbox %s: %s", date_str, segment, exc
+            )
+            continue
+        except requests.RequestException as exc:
+            LOGGER.warning(
+                "CMR request error for %s with bbox %s: %s", date_str, segment, exc
+            )
+            continue
+
+        granules = response.json().get("feed", {}).get("entry", [])
+        for granule in granules:
+            for link in granule.get("links", []):
+                href = link.get("href", "")
+                if href.startswith("https") and href.endswith(".h5") and href not in seen:
+                    seen.add(href)
+                    results.append(href)
+    return results
 
 
 def h5_to_geotiff(h5_path: Path, tile_shapefile_gdf: gpd.GeoDataFrame) -> Path:
@@ -307,7 +364,7 @@ def h5_to_geotiff(h5_path: Path, tile_shapefile_gdf: gpd.GeoDataFrame) -> Path:
     tile_id = tile_match.group()
     bounds_row = tile_shapefile_gdf[tile_shapefile_gdf["TileID"] == tile_id]
     if bounds_row.empty:
-        raise RuntimeError(f"Tile ID {tile_id} not found in shapefile")
+        raise TileMetadataMissingError(f"Tile ID {tile_id} not found in shapefile")
     left, bottom, right, top = bounds_row.total_bounds
 
     tif_path = h5_path.with_suffix(".tif")
@@ -337,7 +394,15 @@ def build_bm_mosaic_for_bbox(
     tif_paths: List[Path] = []
     try:
         for h5_path in h5_paths:
-            tif_paths.append(h5_to_geotiff(h5_path, tile_shapefile_gdf))
+            try:
+                tif_paths.append(h5_to_geotiff(h5_path, tile_shapefile_gdf))
+            except TileMetadataMissingError as exc:
+                LOGGER.warning("Skipping %s: %s", h5_path.name, exc)
+            except RuntimeError:
+                raise
+
+        if not tif_paths:
+            raise RuntimeError("No valid Black Marble tiles available for mosaic")
 
         datasets: List[rasterio.io.DatasetReader] = []
         try:
@@ -503,8 +568,9 @@ def process_samples_parallel(
     tile_shapefile = gpd.read_file(tile_shapefile_path)
 
     results: List[Path] = []
+    failures: list[tuple[dict, Exception]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
+        future_to_sample = {
             executor.submit(
                 process_single_sample,
                 sample,
@@ -514,14 +580,25 @@ def process_samples_parallel(
                 tile_shapefile,
                 output_folder,
                 temp_folder,
-            )
+            ): sample
             for sample in sample_list
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            message, path = future.result()
+        }
+        for future in concurrent.futures.as_completed(future_to_sample):
+            sample = future_to_sample[future]
+            try:
+                message, path = future.result()
+            except Exception as exc:  # pragma: no cover - unexpected worker error
+                failures.append((sample, exc))
+                LOGGER.error(
+                    "Worker failed for sample %s: %s", sample, exc, exc_info=True
+                )
+                continue
             LOGGER.info(message)
             if path is not None:
                 results.append(path)
+
+    if failures:
+        LOGGER.warning("Encountered %d failed samples", len(failures))
 
     shutil.rmtree(temp_folder, ignore_errors=True)
     return results
@@ -780,6 +857,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Use the existing locations CSV instead of regenerating samples",
     )
     parser.add_argument(
+        "--sampling-seed",
+        type=int,
+        default=2024,
+        help="Random seed used when drawing LandScan samples",
+    )
+    parser.add_argument(
         "--countries",
         nargs="+",
         help="Optional list of country names to constrain LandScan sampling",
@@ -794,6 +877,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=str,
         default=DEFAULT_COLLECTION_ID,
         help="NASA CMR collection concept ID",
+    )
+    parser.add_argument(
+        "--date-seed",
+        type=int,
+        default=13492,
+        help="Random seed used when assigning DMSP acquisition dates",
     )
     return parser.parse_args(argv)
 
@@ -812,13 +901,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     else:
         df = sample_landscan_population(
             samples_per_bin=args.samples_per_bin,
+            random_seed=args.sampling_seed,
             output_csv=args.locations_csv,
             countries=args.countries,
             country_column=args.country_column,
         )
 
     dmsp_dates = list_dmsp_dates()
-    df = assign_random_dates(df, dmsp_dates)
+    df = assign_random_dates(df, dmsp_dates, seed=args.date_seed)
     sample_list = df[["Longitude", "Latitude", "date"]].to_dict(orient="records")
 
     token = load_nasa_token()
@@ -841,6 +931,57 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     LOGGER.info("Downloaded %s BM patches and %s DMSP patches", len(bm_patches), len(dmsp_patches))
+    manifest = create_pair_manifest(BM_OUTPUT_DIR, DMSP_OUTPUT_DIR, args.manifest)
+
+    manifest_df = manifest
+    if args.manifest.exists():
+        try:
+            manifest_df = pd.read_csv(args.manifest)
+        except pd.errors.EmptyDataError:
+            manifest_df = pd.DataFrame()
+
+    expected_bm: set[str] = set()
+    expected_dmsp: set[str] = set()
+    if "bm_patch" in manifest_df.columns:
+        expected_bm = {
+            Path(path).name
+            for path in manifest_df["bm_patch"].dropna().astype(str)
+        }
+    if "dmsp_patch" in manifest_df.columns:
+        expected_dmsp = {
+            Path(path).name
+            for path in manifest_df["dmsp_patch"].dropna().astype(str)
+        }
+
+    def iter_rasters(directory: Path) -> Iterable[Path]:
+        seen: set[Path] = set()
+        for pattern in ("*.tif", "*.TIF"):
+            for path in directory.glob(pattern):
+                if path not in seen:
+                    seen.add(path)
+                    yield path
+
+    bm_removed = 0
+    if BM_OUTPUT_DIR.exists():
+        for bm_path in iter_rasters(BM_OUTPUT_DIR):
+            if bm_path.name not in expected_bm:
+                bm_path.unlink(missing_ok=True)
+                bm_removed += 1
+
+    dmsp_removed = 0
+    if DMSP_OUTPUT_DIR.exists():
+        for dmsp_path in iter_rasters(DMSP_OUTPUT_DIR):
+            if dmsp_path.name not in expected_dmsp:
+                dmsp_path.unlink(missing_ok=True)
+                dmsp_removed += 1
+
+    if bm_removed or dmsp_removed:
+        LOGGER.info(
+            "Removed %s unmatched BM rasters and %s unmatched DMSP rasters", bm_removed, dmsp_removed
+        )
+    else:
+        LOGGER.info("No unmatched BM or DMSP rasters were removed")
+
     create_pair_manifest(BM_OUTPUT_DIR, DMSP_OUTPUT_DIR, args.manifest)
 
 

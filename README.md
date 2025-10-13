@@ -53,4 +53,16 @@ python data_sampler.py --countries "United States" Canada
 
 The script will infer the appropriate attribute column from `Data/World_Countries/World_Countries_Generalized.shp`, but you can override it with `--country-column` if needed.
 
+Set `--sampling-seed` to reproduce the LandScan sample selection and `--date-seed` to control how DMSP acquisition dates are drawn. Both defaults mirror the values used in the original pipeline, so your historical runs stay consistent unless you override them.
+
 All command-line options can be viewed with `python data_sampler.py --help`.
+
+## Testing
+
+The regression checks live in `tests/test_data_sampler.py`. The module stubs out heavyweight dependencies (e.g., `rasterio`, `geopandas`, `boto3`) so the suite can exercise the downloader’s control flow—dateline-aware CMR queries, worker failure handling, and missing tile metadata—without needing the full geospatial stack. Run the tests with:
+
+```bash
+pytest
+```
+
+Keeping this file up to date ensures future changes preserve the downloader’s resilience characteristics, even in lightweight CI environments.
