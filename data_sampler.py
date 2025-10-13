@@ -1005,15 +1005,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     yield path
 
     bm_removed = 0
-    if bm_dir.exists():
-        for bm_path in iter_rasters(bm_dir):
+    if BM_OUTPUT_DIR.exists():
+        for bm_path in iter_rasters(BM_OUTPUT_DIR):
             if bm_path.name not in expected_bm:
                 bm_path.unlink(missing_ok=True)
                 bm_removed += 1
 
     dmsp_removed = 0
-    if dmsp_dir.exists():
-        for dmsp_path in iter_rasters(dmsp_dir):
+    if DMSP_OUTPUT_DIR.exists():
+        for dmsp_path in iter_rasters(DMSP_OUTPUT_DIR):
             if dmsp_path.name not in expected_dmsp:
                 dmsp_path.unlink(missing_ok=True)
                 dmsp_removed += 1
