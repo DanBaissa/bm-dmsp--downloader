@@ -9,7 +9,7 @@ import random
 import re
 import shutil
 from pathlib import Path
-from typing import List, Sequence
+from typing import Iterable, List, Sequence
 
 import boto3
 from botocore import UNSIGNED
@@ -841,6 +841,57 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     LOGGER.info("Downloaded %s BM patches and %s DMSP patches", len(bm_patches), len(dmsp_patches))
+    manifest = create_pair_manifest(BM_OUTPUT_DIR, DMSP_OUTPUT_DIR, args.manifest)
+
+    manifest_df = manifest
+    if args.manifest.exists():
+        try:
+            manifest_df = pd.read_csv(args.manifest)
+        except pd.errors.EmptyDataError:
+            manifest_df = pd.DataFrame()
+
+    expected_bm: set[str] = set()
+    expected_dmsp: set[str] = set()
+    if "bm_patch" in manifest_df.columns:
+        expected_bm = {
+            Path(path).name
+            for path in manifest_df["bm_patch"].dropna().astype(str)
+        }
+    if "dmsp_patch" in manifest_df.columns:
+        expected_dmsp = {
+            Path(path).name
+            for path in manifest_df["dmsp_patch"].dropna().astype(str)
+        }
+
+    def iter_rasters(directory: Path) -> Iterable[Path]:
+        seen: set[Path] = set()
+        for pattern in ("*.tif", "*.TIF"):
+            for path in directory.glob(pattern):
+                if path not in seen:
+                    seen.add(path)
+                    yield path
+
+    bm_removed = 0
+    if BM_OUTPUT_DIR.exists():
+        for bm_path in iter_rasters(BM_OUTPUT_DIR):
+            if bm_path.name not in expected_bm:
+                bm_path.unlink(missing_ok=True)
+                bm_removed += 1
+
+    dmsp_removed = 0
+    if DMSP_OUTPUT_DIR.exists():
+        for dmsp_path in iter_rasters(DMSP_OUTPUT_DIR):
+            if dmsp_path.name not in expected_dmsp:
+                dmsp_path.unlink(missing_ok=True)
+                dmsp_removed += 1
+
+    if bm_removed or dmsp_removed:
+        LOGGER.info(
+            "Removed %s unmatched BM rasters and %s unmatched DMSP rasters", bm_removed, dmsp_removed
+        )
+    else:
+        LOGGER.info("No unmatched BM or DMSP rasters were removed")
+
     create_pair_manifest(BM_OUTPUT_DIR, DMSP_OUTPUT_DIR, args.manifest)
 
 
