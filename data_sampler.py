@@ -8,36 +8,33 @@ Original file is located at
 """
 
 # Commented out IPython magic to ensure Python compatibility.
-from google.colab import userdata
-
-# Get token
-token = userdata.get('Colab_token')
-NASA_Token = userdata.get('NASA_Token')
-
-# Clone
-!git clone https://github.com/DanBaissa/bm-dmsp-pretraining-pipeline
-
-# Change into the directory
-# %cd bm-dmsp-pretraining-pipeline
-
-# Set remote to use token (for pushing)
-!git remote set-url origin https://{token}@github.com/DanBaissa/bm-dmsp-pretraining-pipeline.git
-
-# Set Git config (only needs to be done once per session)
-!git config --global user.email "danbaissa@gmail.com"
-!git config --global user.name "Dan Baissa"
-
 import os
-# os.chdir('bm-dmsp-pretraining-pipeline')
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
+NASA_Token = os.getenv("NASA_TOKEN")
+
+if not NASA_Token:
+    raise RuntimeError(
+        "NASA_TOKEN environment variable is not set. "
+        "Create a .env file (see .env.example) with your NASA Earthdata token before running downloads."
+    )
+
+# Optional: print current working directory for debugging
 print(os.getcwd())
 
-# !pip install rasterio geopandas shapely
-!pip install rasterio boto3 tqdm
 
 import os
 import re
 import time
 import shutil
+import csv
 import requests
 import numpy as np
 import pandas as pd
@@ -490,6 +487,39 @@ def extract_patch_from_geotiff(tif_path, lon, lat, patch_size_pix):
     return patch, patch_meta
 
 # Per-sample worker function
+def download_with_progress(url, dest_path, headers=None, chunk_size=1024 * 1024, desc=None):
+    with requests.get(url, headers=headers, stream=True) as response:
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as err:
+            snippet = ""
+            try:
+                snippet = response.text[:200]
+            except Exception:
+                snippet = ""
+            raise RuntimeError(f"Failed to download {url}: {err}. Response preview: {snippet}") from err
+
+        total = response.headers.get("content-length")
+        total = int(total) if total is not None else None
+        progress = tqdm(
+            total=total,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc=desc or os.path.basename(dest_path),
+            leave=False,
+        )
+        try:
+            with open(dest_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    progress.update(len(chunk))
+        finally:
+            progress.close()
+
+
 def process_single_sample(sample, patch_size_pix, collection_id, token, tile_shapefile, output_folder, temp_folder):
     lon, lat, date_str = sample['Longitude'], sample['Latitude'], sample['date']
     bbox = get_patch_bbox(lon, lat, patch_size_pix, tif_res_deg=0.004)  # VIIRS typical: 0.004 deg/pix
@@ -499,9 +529,15 @@ def process_single_sample(sample, patch_size_pix, collection_id, token, tile_sha
     h5_url = urls[0]  # Pick the first match
     h5_path = os.path.join(temp_folder, os.path.basename(h5_url))
     if not os.path.exists(h5_path):
-        r = requests.get(h5_url, headers={"Authorization": f"Bearer {token}"})
-        with open(h5_path, "wb") as f:
-            f.write(r.content)
+        try:
+            download_with_progress(
+                h5_url,
+                h5_path,
+                headers={"Authorization": f"Bearer {token}"},
+                desc=f"BM {date_str} download",
+            )
+        except Exception as exc:
+            return f"❌ Failed to download {h5_url}: {exc}"
     tif_path = h5_path.replace(".h5", ".tif")
     with h5py.File(h5_path, "r") as f:
         ntl_path = "/HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields/Gap_Filled_DNB_BRDF-Corrected_NTL"
@@ -611,21 +647,50 @@ def wait_for_file_release(path, timeout=10):
                 raise
             time.sleep(0.5)
 
-def safe_download(s3, bucket, key, outpath, max_retries=5):
+def safe_download(s3, bucket, key, outpath, max_retries=5, desc=None):
+    last_error = None
     for attempt in range(max_retries):
+        progress = None
         try:
-            s3.download_file(bucket, key, outpath)
+            total = None
+            try:
+                head = s3.head_object(Bucket=bucket, Key=key)
+                total = head.get("ContentLength")
+            except botocore.exceptions.ClientError as head_err:
+                last_error = f"ClientError during head_object: {head_err}"
+            progress = tqdm(
+                total=total,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=desc or os.path.basename(key),
+                leave=False,
+            )
+
+            def _hook(bytes_amount):
+                progress.update(bytes_amount)
+
+            s3.download_file(bucket, key, outpath, Callback=_hook)
             wait_for_file_release(outpath)
-            return True
+            progress.close()
+            return True, None
         except botocore.exceptions.EndpointConnectionError as e:
-            print(f"EndpointConnectionError on {key} (attempt {attempt+1}/{max_retries}): {e}")
+            last_error = f"EndpointConnectionError: {e}"
         except botocore.exceptions.ClientError as e:
-            print(f"ClientError on {key} (attempt {attempt+1}/{max_retries}): {e}")
+            last_error = f"ClientError: {e}"
         except Exception as e:
-            print(f"Other error on {key} (attempt {attempt+1}/{max_retries}): {e}")
+            last_error = f"Unexpected error: {e}"
+        finally:
+            if progress is not None:
+                progress.close()
         time.sleep(2)
-    print(f"Failed to download after {max_retries} attempts: {key}")
-    return False
+    if os.path.exists(outpath):
+        try:
+            os.remove(outpath)
+        except OSError:
+            pass
+    error_message = last_error or f"Failed to download after {max_retries} attempts"
+    return False, error_message
 
 def group_by_f_number(file_keys):
     groups = defaultdict(list)
@@ -669,7 +734,16 @@ def process_bm_patch_for_best_fnumber(bm_patch_path, file_keys, s3, bucket_name,
             vis_file = os.path.join(out_dir, os.path.basename(vis_key))
             if not os.path.exists(vis_file):
                 print(f"Downloading {vis_key} ...")
-                safe_download(s3, bucket_name, vis_key, vis_file)
+                success, error_message = safe_download(
+                    s3,
+                    bucket_name,
+                    vis_key,
+                    vis_file,
+                    desc=f"DMSP {os.path.basename(vis_key)}",
+                )
+                if not success:
+                    print(f"❌ Failed to download {vis_key}: {error_message}")
+                    continue
             try:
                 vis_patch = reproject_to_bm_grid(vis_file, bm_profile)
                 valid_pixels = np.sum(~np.isnan(vis_patch))
@@ -831,6 +905,35 @@ for dmsp_file in dmsp_files:
         pair_list.append((dmsp_file, bm_file, patch_key))
 
 pair_list.sort(key=lambda x: (x[2], x[0]))  # Sort for reproducibility
+
+matched_tiles_root = "Matched_Tiles"
+matched_bm_dir = os.path.join(matched_tiles_root, "bm")
+matched_dmsp_dir = os.path.join(matched_tiles_root, "dmsp")
+if os.path.isdir(matched_tiles_root):
+    shutil.rmtree(matched_tiles_root)
+os.makedirs(matched_bm_dir, exist_ok=True)
+os.makedirs(matched_dmsp_dir, exist_ok=True)
+
+manifest_path = os.path.join(matched_tiles_root, "matched_tiles_manifest.csv")
+with open(manifest_path, "w", newline="") as manifest_file:
+    writer = csv.writer(manifest_file)
+    writer.writerow(["tile_name", "bm_source", "dmsp_source", "patch_key"])
+    for idx, (dmsp_file, bm_file, patch_key) in enumerate(
+        tqdm(pair_list, desc="Saving matched GeoTIFFs", unit="tile"), start=1
+    ):
+        tile_name = f"tile_{idx:03d}.tif"
+        bm_src = os.path.join(bm_dir, bm_file)
+        dmsp_src = os.path.join(dmsp_dir, dmsp_file)
+        bm_dest = os.path.join(matched_bm_dir, tile_name)
+        dmsp_dest = os.path.join(matched_dmsp_dir, tile_name)
+        shutil.copy2(bm_src, bm_dest)
+        shutil.copy2(dmsp_src, dmsp_dest)
+        writer.writerow([tile_name, bm_file, dmsp_file, patch_key])
+
+print(
+    f"Saved {len(pair_list)} matched tile pairs to {matched_tiles_root} "
+    f"(manifest: {manifest_path})."
+)
 
 def augmentations(img):
     angles = [0, 90, 180, 270]
