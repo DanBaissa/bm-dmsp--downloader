@@ -21,7 +21,26 @@ sys.modules.setdefault("botocore.exceptions", dummy_botocore.exceptions)
 sys.modules.setdefault("botocore.config", dummy_botocore.config)
 
 dummy_boto3 = types.ModuleType("boto3")
-dummy_boto3.client = lambda *args, **kwargs: None
+
+
+class _DummyPaginator:
+    def paginate(self, **kwargs):
+        return []
+
+
+class _DummyS3:
+    def get_paginator(self, *_args, **_kwargs):
+        return _DummyPaginator()
+
+    def head_object(self, **_kwargs):
+        return {"ContentLength": 0}
+
+    def download_file(self, *_args, Callback=None, **_kwargs):
+        if Callback is not None:
+            Callback(0)
+
+
+dummy_boto3.client = lambda *args, **kwargs: _DummyS3()
 dummy_boto3.resource = lambda *args, **kwargs: None
 sys.modules.setdefault("boto3", dummy_boto3)
 
@@ -153,7 +172,6 @@ sys.modules.setdefault("rasterio.warp", dummy_rasterio.warp)
 dummy_requests = types.ModuleType("requests")
 dummy_requests.HTTPError = Exception
 dummy_requests.RequestException = Exception
-dummy_requests.get = lambda *args, **kwargs: None
 sys.modules.setdefault("requests", dummy_requests)
 
 import data_sampler
@@ -166,6 +184,7 @@ class DummyResponse:
         self.status_code = status_code
         self._payload = payload or {}
         self._raise_error = raise_error
+        self.headers = self._payload.get("headers", {})
 
     def raise_for_status(self):
         if self._raise_error or self.status_code >= 400:
@@ -173,6 +192,22 @@ class DummyResponse:
 
     def json(self):
         return self._payload
+
+    def iter_content(self, chunk_size=8192):
+        content = self._payload.get("content", b"")
+        if isinstance(content, (bytes, bytearray)):
+            yield content
+        else:
+            yield b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+dummy_requests.get = lambda *args, **kwargs: DummyResponse(200)
 
 
 def test_search_nasa_cmr_handles_dateline_split(monkeypatch):
@@ -217,14 +252,23 @@ def test_process_samples_parallel_continues_after_failure(monkeypatch, tmp_path)
 
     monkeypatch.setattr(data_sampler.gpd, "read_file", fake_read_file)
 
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
     def fake_worker(sample, *args, **kwargs):
         if sample["id"] == "fail":
             raise RuntimeError("boom")
-        return (f"ok {sample['id']}", tmp_path / f"{sample['id']}.tif")
+        path = output_dir / f"{sample['id']}.tif"
+        path.write_bytes(b"data")
+        return (f"ok {sample['id']}", path)
 
     monkeypatch.setattr(data_sampler, "process_single_sample", fake_worker)
 
-    samples = [{"id": "a"}, {"id": "fail"}, {"id": "b"}]
+    samples = [
+        {"id": "a", "Longitude": 1.0, "Latitude": 2.0, "date": "2014-01-01"},
+        {"id": "fail", "Longitude": 3.0, "Latitude": 4.0, "date": "2014-01-02"},
+        {"id": "b", "Longitude": 5.0, "Latitude": 6.0, "date": "2014-01-03"},
+    ]
     results = data_sampler.process_samples_parallel(
         samples,
         patch_size_pix=10,
@@ -236,7 +280,8 @@ def test_process_samples_parallel_continues_after_failure(monkeypatch, tmp_path)
         max_workers=2,
     )
 
-    assert sorted(path.name for path in results) == ["a.tif", "b.tif"]
+    assert [patch.tile_id for patch in results] == ["tile_001", "tile_002"]
+    assert all(patch.path.name == f"{patch.tile_id}.tif" for patch in results)
 
 
 def test_build_bm_mosaic_skips_missing_tiles(monkeypatch, tmp_path):
