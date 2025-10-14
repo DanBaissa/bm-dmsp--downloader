@@ -622,6 +622,7 @@ def safe_download(s3, bucket: str, key: str, outpath: Path, max_retries: int = 5
     import time
 
     for attempt in range(max_retries):
+        progress = None
         try:
             s3.download_file(bucket, key, str(outpath))
             wait_for_file_release(outpath)
