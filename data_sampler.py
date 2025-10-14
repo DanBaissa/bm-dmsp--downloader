@@ -9,6 +9,9 @@ import os
 import random
 import re
 import shutil
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
@@ -32,6 +35,11 @@ import rasterio.windows
 import requests
 
 try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
+
+try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional dependency
     load_dotenv = None
@@ -47,8 +55,9 @@ DEFAULT_COLLECTION_ID = "C3365931269-LAADS"
 DEFAULT_TILE_SHAPEFILE = Path("Data/Black_Marble_IDs/Black_Marble_World_tiles.shp")
 LANDSCAN_RASTER = Path("Data/Global_2012/landscan-global-2012.tif")
 COUNTRIES_SHP = Path("Data/World_Countries/World_Countries_Generalized.shp")
-BM_OUTPUT_DIR = Path("Raw_NL_Data/BM data")
-DMSP_OUTPUT_DIR = Path("Raw_NL_Data/DMSP data")
+PAIR_OUTPUT_ROOT = Path("Raw_NL_Data")
+BM_OUTPUT_DIR = PAIR_OUTPUT_ROOT / "bm"
+DMSP_OUTPUT_DIR = PAIR_OUTPUT_ROOT / "dmsp"
 PLOTS_DIR = Path("plots")
 DEFAULT_LOCATIONS_CSV = Path("sampled_locations.csv")
 DEFAULT_MANIFEST = Path("Raw_NL_Data/bm_dmsp_pairs.csv")
@@ -58,6 +67,78 @@ BM_DATASET_PATH = "/HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields/Gap_Filled_DNB_BR
 
 class TileMetadataMissingError(RuntimeError):
     """Raised when a Black Marble granule cannot be located in the tile index."""
+
+
+class DownloadError(RuntimeError):
+    """Raised when an object cannot be downloaded after multiple attempts."""
+
+    def __init__(self, bucket: str, key: str, attempts: int, error: Exception):
+        super().__init__(
+            f"Failed to download s3://{bucket}/{key} after {attempts} attempts: {error}"
+        )
+        self.bucket = bucket
+        self.key = key
+        self.attempts = attempts
+        self.error = error
+
+
+@dataclass
+class BMPatch:
+    tile_id: str
+    path: Path
+    longitude: float
+    latitude: float
+    date: str
+
+
+@dataclass
+class DMSPMatch:
+    tile_id: str
+    bm_path: Path
+    dmsp_path: Path
+    f_number: str
+    correlation: float
+    valid_fraction: float
+    source_key: str
+
+
+@dataclass
+class DownloadFailure:
+    tile_id: str
+    bm_path: Path
+    key: str
+    error: Exception
+
+
+@contextmanager
+def _progress_bar(total: int | None, description: str):
+    if tqdm is None:
+        yield None
+        return
+    bar = tqdm(total=total, unit="B", unit_scale=True, desc=description, leave=False)
+    try:
+        yield bar
+    finally:
+        bar.close()
+
+
+def _write_response_to_file(response, destination: Path, description: str) -> None:
+    chunk_size = 1024 * 128
+    total_header = response.headers.get("Content-Length") if hasattr(response, "headers") else None
+    total: int | None = None
+    if total_header is not None:
+        try:
+            total = int(total_header)
+        except (TypeError, ValueError):  # pragma: no cover - malformed header
+            total = None
+    with destination.open("wb") as fh:
+        with _progress_bar(total, description) as bar:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                if bar is not None:
+                    bar.update(len(chunk))
 
 
 def infer_country_column(gdf: gpd.GeoDataFrame, country_column: str | None = None) -> str:
@@ -492,6 +573,7 @@ def process_single_sample(
     temp_folder: Path,
 ) -> tuple[str, Path | None]:
     lon, lat, date_str = sample["Longitude"], sample["Latitude"], sample["date"]
+    tile_id = sample["tile_id"]
     if lat < -60:
         return (f"Skipping Antarctica sample at ({lon:.3f}, {lat:.3f})", None)
 
@@ -515,10 +597,20 @@ def process_single_sample(
         for url in urls:
             h5_path = sample_temp / os.path.basename(url)
             if not h5_path.exists():
-                response = requests.get(url, headers=headers)
+                LOGGER.info("Downloading Black Marble granule %s for %s", url, tile_id)
+                response = requests.get(url, headers=headers, stream=True)
                 response.raise_for_status()
-                h5_path.write_bytes(response.content)
-            h5_paths.append(h5_path)
+                try:
+                    _write_response_to_file(
+                        response,
+                        h5_path,
+                        f"BM {tile_id}: {os.path.basename(url)}",
+                    )
+                finally:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
+        h5_paths.append(h5_path)
 
         mosaic_array, mosaic_transform, mosaic_profile = build_bm_mosaic_for_bbox(
             h5_paths, tile_shapefile
@@ -527,7 +619,7 @@ def process_single_sample(
             mosaic_array, mosaic_transform, bbox, patch_size_pix
         )
 
-        out_path = output_folder / f"BM_patch_{date_str}_{lon:.3f}_{lat:.3f}.tif"
+        out_path = output_folder / f"{tile_id}.tif"
         profile = mosaic_profile.copy()
         profile.update(
             {
@@ -550,7 +642,10 @@ def process_single_sample(
             path.unlink(missing_ok=True)
         shutil.rmtree(sample_temp, ignore_errors=True)
 
-    return (f"Saved mosaic patch: {out_path}", out_path)
+    return (
+        f"Saved mosaic patch: {out_path}",
+        BMPatch(tile_id=tile_id, path=out_path, longitude=lon, latitude=lat, date=date_str),
+    )
 
 
 def process_samples_parallel(
@@ -562,12 +657,12 @@ def process_samples_parallel(
     output_folder: Path,
     temp_folder: Path,
     max_workers: int = 4,
-) -> List[Path]:
+) -> List[BMPatch]:
     output_folder.mkdir(parents=True, exist_ok=True)
     temp_folder.mkdir(parents=True, exist_ok=True)
     tile_shapefile = gpd.read_file(tile_shapefile_path)
 
-    results: List[Path] = []
+    results: List[BMPatch] = []
     failures: list[tuple[dict, Exception]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_sample = {
@@ -586,7 +681,7 @@ def process_samples_parallel(
         for future in concurrent.futures.as_completed(future_to_sample):
             sample = future_to_sample[future]
             try:
-                message, path = future.result()
+                message, patch = future.result()
             except Exception as exc:  # pragma: no cover - unexpected worker error
                 failures.append((sample, exc))
                 LOGGER.error(
@@ -594,8 +689,8 @@ def process_samples_parallel(
                 )
                 continue
             LOGGER.info(message)
-            if path is not None:
-                results.append(path)
+            if patch is not None:
+                results.append(patch)
 
     if failures:
         LOGGER.warning("Encountered %d failed samples", len(failures))
@@ -618,24 +713,77 @@ def wait_for_file_release(path: Path, timeout: float = 10.0) -> None:
             time.sleep(0.5)
 
 
-def safe_download(s3, bucket: str, key: str, outpath: Path, max_retries: int = 5) -> bool:
-    import time
-
-    for attempt in range(max_retries):
-        progress = None
+def safe_download(s3, bucket: str, key: str, outpath: Path, max_retries: int = 5) -> Path:
+    object_size: int | None = None
+    if tqdm is not None:
         try:
-            s3.download_file(bucket, key, str(outpath))
+            head = s3.head_object(Bucket=bucket, Key=key)
+            object_size = head.get("ContentLength")
+        except Exception as exc:  # pragma: no cover - optional diagnostics
+            LOGGER.debug("Unable to determine size for %s: %s", key, exc)
+
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        progress_bar = None
+        try:
+            if tqdm is not None:
+                desc = f"DMSP {os.path.basename(key)}"
+                progress_bar = tqdm(
+                    total=object_size,
+                    unit="B",
+                    unit_scale=True,
+                    desc=desc,
+                    leave=False,
+                )
+
+                def _callback(bytes_amount, bar=progress_bar):
+                    bar.update(bytes_amount)
+
+                callback = _callback
+            else:
+                callback = None
+
+            if callback is not None:
+                s3.download_file(bucket, key, str(outpath), Callback=callback)
+            else:
+                s3.download_file(bucket, key, str(outpath))
             wait_for_file_release(outpath)
-            return True
+            return outpath
         except botocore.exceptions.EndpointConnectionError as exc:  # pragma: no cover - network
-            LOGGER.warning("EndpointConnectionError on %s (attempt %s/%s): %s", key, attempt + 1, max_retries, exc)
+            last_error = exc
+            LOGGER.warning(
+                "EndpointConnectionError on %s (attempt %s/%s): %s",
+                key,
+                attempt,
+                max_retries,
+                exc,
+            )
         except botocore.exceptions.ClientError as exc:  # pragma: no cover - network
-            LOGGER.warning("ClientError on %s (attempt %s/%s): %s", key, attempt + 1, max_retries, exc)
+            last_error = exc
+            LOGGER.warning(
+                "ClientError on %s (attempt %s/%s): %s",
+                key,
+                attempt,
+                max_retries,
+                exc,
+            )
         except Exception as exc:  # pragma: no cover - network
-            LOGGER.warning("Other error on %s (attempt %s/%s): %s", key, attempt + 1, max_retries, exc)
+            last_error = exc
+            LOGGER.warning(
+                "Other error on %s (attempt %s/%s): %s",
+                key,
+                attempt,
+                max_retries,
+                exc,
+            )
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
         time.sleep(2)
+
+    error = last_error or RuntimeError("Unknown download failure")
     LOGGER.error("Failed to download %s after %s attempts", key, max_retries)
-    return False
+    raise DownloadError(bucket, key, max_retries, error)
 
 
 def reproject_to_bm_grid(src_path: Path, bm_profile: dict) -> np.ndarray:
@@ -672,20 +820,21 @@ def compute_patch_correlation(bm_patch: np.ndarray, dmsp_patch: np.ndarray) -> f
 
 
 def select_best_dmsp_match(
-    bm_patch_path: Path,
+    bm_patch: BMPatch,
     file_keys: Sequence[tuple[str, None]],
     s3,
     bucket_name: str,
     download_dir: Path,
     dmsp_out_dir: Path,
     min_valid_fraction: float = 0.10,
-) -> List[Path]:
+) -> tuple[DMSPMatch | None, List[DownloadFailure]]:
+    bm_patch_path = bm_patch.path
     bm_patch_name = bm_patch_path.name
     with rasterio.open(bm_patch_path) as bm_src:
         bm_profile = bm_src.profile.copy()
         bm_shape = (bm_src.height, bm_src.width)
-        bm_patch = bm_src.read(1).astype(np.float32)
-        bm_patch[bm_patch < 0] = np.nan
+        bm_patch_array = bm_src.read(1).astype(np.float32)
+        bm_patch_array[bm_patch_array < 0] = np.nan
 
     total_pixels = bm_shape[0] * bm_shape[1]
     best_corr = None
@@ -693,6 +842,8 @@ def select_best_dmsp_match(
     best_vis_file: Path | None = None
     best_valid_fraction = 0.0
     best_f_number = ""
+    best_source_key = ""
+    failures: List[DownloadFailure] = []
 
     for vis_key, _ in file_keys:
         base = os.path.basename(vis_key)
@@ -700,7 +851,23 @@ def select_best_dmsp_match(
         vis_file = download_dir / base
         if not vis_file.exists():
             LOGGER.info("Downloading %s", vis_key)
-            if not safe_download(s3, bucket_name, vis_key, vis_file):
+            try:
+                safe_download(s3, bucket_name, vis_key, vis_file)
+            except DownloadError as exc:
+                LOGGER.warning(
+                    "Failed to download %s for tile %s: %s",
+                    vis_key,
+                    bm_patch.tile_id,
+                    exc,
+                )
+                failures.append(
+                    DownloadFailure(
+                        tile_id=bm_patch.tile_id,
+                        bm_path=bm_patch_path,
+                        key=vis_key,
+                        error=exc,
+                    )
+                )
                 continue
         try:
             vis_patch = reproject_to_bm_grid(vis_file, bm_profile)
@@ -717,7 +884,7 @@ def select_best_dmsp_match(
                 valid_fraction * 100,
             )
             continue
-        corr = compute_patch_correlation(bm_patch, vis_patch)
+        corr = compute_patch_correlation(bm_patch_array, vis_patch)
         if corr is None:
             LOGGER.debug("Unable to compute correlation for %s", base)
             continue
@@ -727,16 +894,13 @@ def select_best_dmsp_match(
             best_vis_file = vis_file
             best_valid_fraction = valid_fraction
             best_f_number = f_number
+            best_source_key = vis_key
 
     if best_vis_file is None or best_vis_patch is None or best_corr is None:
         LOGGER.info("No DMSP scene correlated well with %s", bm_patch_name)
-        return []
+        return (None, failures)
 
-    out_fname = (
-        f"{best_f_number}_{best_vis_file.stem}_corr_{best_corr:.3f}_"
-        f"match_{bm_patch_name.replace('.tif', '')}.tif"
-    )
-    out_path = dmsp_out_dir / out_fname
+    out_path = dmsp_out_dir / f"{bm_patch.tile_id}.tif"
     out_profile = bm_profile.copy()
     out_profile.update({"dtype": "float32", "count": 1, "nodata": np.nan})
     dmsp_out_dir.mkdir(parents=True, exist_ok=True)
@@ -748,18 +912,29 @@ def select_best_dmsp_match(
         best_corr,
         best_valid_fraction * 100,
     )
-    return [out_path]
+    return (
+        DMSPMatch(
+            tile_id=bm_patch.tile_id,
+            bm_path=bm_patch_path,
+            dmsp_path=out_path,
+            f_number=best_f_number,
+            correlation=best_corr,
+            valid_fraction=best_valid_fraction,
+            source_key=best_source_key,
+        ),
+        failures,
+    )
 
 
 def parallel_process_bm_patch(
-    bm_patch_path: Path,
+    bm_patch: BMPatch,
     s3,
     bucket_name: str,
     temp_dir: Path,
     dmsp_out_dir: Path,
-) -> List[Path]:
-    bm_date = bm_patch_path.name.split("_")[2]
-    dmsp_date_str = bm_date.replace("-", "")
+) -> tuple[List[DMSPMatch], List[DownloadFailure]]:
+    bm_patch_path = bm_patch.path
+    dmsp_date_str = bm_patch.date.replace("-", "")
     satellites = [f"F{n}" for n in range(10, 19)]
     file_keys: List[tuple[str, None]] = []
     for sat in satellites:
@@ -772,9 +947,9 @@ def parallel_process_bm_patch(
                     file_keys.append((key, None))
     if not file_keys:
         LOGGER.info("No DMSP scenes found for %s", bm_patch_path.name)
-        return []
-    saved = select_best_dmsp_match(
-        bm_patch_path,
+        return ([], [])
+    match, failures = select_best_dmsp_match(
+        bm_patch,
         file_keys,
         s3,
         bucket_name,
@@ -782,29 +957,30 @@ def parallel_process_bm_patch(
         dmsp_out_dir,
     )
     shutil.rmtree(temp_dir, ignore_errors=True)
-    return saved
+    return (([match] if match else []), failures)
 
 
 def download_dmsp_matches(
-    bm_patch_paths: Sequence[Path],
+    bm_patches: Sequence[BMPatch],
     dmsp_out_dir: Path,
     temp_dir: Path,
     max_workers: int = 4,
-) -> List[Path]:
+) -> tuple[List[DMSPMatch], List[DownloadFailure]]:
     dmsp_out_dir.mkdir(parents=True, exist_ok=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
     s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
     bucket_name = "globalnightlight"
-    saved_paths: List[Path] = []
+    saved_matches: List[DMSPMatch] = []
+    failures: List[DownloadFailure] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
-        for path in bm_patch_paths:
-            patch_temp = temp_dir / path.stem
+        for patch in bm_patches:
+            patch_temp = temp_dir / patch.path.stem
             patch_temp.mkdir(parents=True, exist_ok=True)
             futures.append(
                 executor.submit(
                     parallel_process_bm_patch,
-                    path,
+                    patch,
                     s3,
                     bucket_name,
                     patch_temp,
@@ -812,36 +988,49 @@ def download_dmsp_matches(
                 )
             )
         for future in concurrent.futures.as_completed(futures):
-            saved_paths.extend(future.result())
+            matches, download_failures = future.result()
+            saved_matches.extend(matches)
+            failures.extend(download_failures)
     shutil.rmtree(temp_dir, ignore_errors=True)
-    return saved_paths
+    return saved_matches, failures
 
 
-def create_pair_manifest(bm_dir: Path, dmsp_dir: Path, manifest_path: Path) -> pd.DataFrame:
-    bm_files = {path.stem: path for path in bm_dir.glob("*.tif")}
+def create_pair_manifest(
+    bm_patches: Sequence[BMPatch],
+    dmsp_matches: Sequence[DMSPMatch],
+    manifest_path: Path,
+) -> pd.DataFrame:
+    bm_lookup = {patch.tile_id: patch for patch in bm_patches}
     rows = []
-    pattern = re.compile(
-        r"^(?P<f_number>F\d+)_.+_corr_(?P<corr>-?\d+(?:\.\d+)?)_match_(?P<bm_key>BM_patch_.+)$"
-    )
-    for dmsp_path in dmsp_dir.glob("*.tif"):
-        match = pattern.match(dmsp_path.stem)
-        if not match:
-            continue
-        bm_key = match.group("bm_key")
-        if bm_key in bm_files:
-            rows.append(
-                {
-                    "bm_patch": str(bm_files[bm_key]),
-                    "dmsp_patch": str(dmsp_path),
-                    "f_number": match.group("f_number"),
-                    "correlation": float(match.group("corr")),
-                }
+    for match in dmsp_matches:
+        bm_patch = bm_lookup.get(match.tile_id)
+        if bm_patch is None:
+            LOGGER.debug(
+                "Skipping manifest entry for %s because BM patch is missing",
+                match.tile_id,
             )
+            continue
+        rows.append(
+            {
+                "tile_id": match.tile_id,
+                "bm_patch": str(bm_patch.path),
+                "dmsp_patch": str(match.dmsp_path),
+                "longitude": bm_patch.longitude,
+                "latitude": bm_patch.latitude,
+                "date": bm_patch.date,
+                "f_number": match.f_number,
+                "correlation": match.correlation,
+                "valid_fraction": match.valid_fraction,
+                "dmsp_source_key": match.source_key,
+            }
+        )
     manifest = pd.DataFrame(rows)
     if not manifest.empty:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest.to_csv(manifest_path, index=False)
         LOGGER.info("Wrote manifest to %s", manifest_path)
+    else:
+        LOGGER.info("No paired BM/DMSP tiles to record in manifest")
     return manifest
 
 
@@ -915,8 +1104,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     output_root = args.output_folder.expanduser() if args.output_folder else None
 
-    bm_dir = output_root / "BM data" if output_root else BM_OUTPUT_DIR
-    dmsp_dir = output_root / "DMSP data" if output_root else DMSP_OUTPUT_DIR
+    bm_dir = output_root / "bm" if output_root else BM_OUTPUT_DIR
+    dmsp_dir = output_root / "dmsp" if output_root else DMSP_OUTPUT_DIR
     plots_dir = output_root / "plots" if output_root else PLOTS_DIR
     temp_dir = output_root / "temp_dl" if output_root else Path("temp_dl")
     dmsp_temp_dir = output_root / "DMSP_Raw_Temp" if output_root else Path("DMSP_Raw_Temp")
@@ -953,7 +1142,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     dmsp_dates = list_dmsp_dates()
     df = assign_random_dates(df, dmsp_dates, seed=args.date_seed)
-    sample_list = df[["Longitude", "Latitude", "date"]].to_dict(orient="records")
+    base_samples = df[["Longitude", "Latitude", "date"]].to_dict(orient="records")
+    sample_list = []
+    for idx, sample in enumerate(base_samples, start=1):
+        tile_id = f"tile_{idx:03d}"
+        enriched = dict(sample)
+        enriched["tile_id"] = tile_id
+        sample_list.append(enriched)
 
     token = load_nasa_token()
     bm_patches = process_samples_parallel(
@@ -967,15 +1162,35 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_workers=args.max_workers,
     )
 
-    dmsp_patches = download_dmsp_matches(
-        bm_patch_paths=bm_patches,
+    dmsp_matches, download_failures = download_dmsp_matches(
+        bm_patches=bm_patches,
         dmsp_out_dir=dmsp_dir,
         temp_dir=dmsp_temp_dir,
         max_workers=args.max_workers,
     )
 
-    LOGGER.info("Downloaded %s BM patches and %s DMSP patches", len(bm_patches), len(dmsp_patches))
-    manifest = create_pair_manifest(bm_dir, dmsp_dir, manifest_path)
+    LOGGER.info(
+        "Downloaded %s BM patches and %s DMSP patches",
+        len(bm_patches),
+        len(dmsp_matches),
+    )
+    if download_failures:
+        failed_tiles = {failure.tile_id for failure in download_failures}
+        LOGGER.warning(
+            "Encountered %s download failures across %s tiles",
+            len(download_failures),
+            len(failed_tiles),
+        )
+        for failure in download_failures:
+            LOGGER.warning(
+                "Tile %s (%s) failed to download %s: %s",
+                failure.tile_id,
+                failure.bm_path.name,
+                failure.key,
+                failure.error,
+            )
+
+    manifest = create_pair_manifest(bm_patches, dmsp_matches, manifest_path)
 
     manifest_df = manifest
     if manifest_path.exists():
@@ -984,18 +1199,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         except pd.errors.EmptyDataError:
             manifest_df = pd.DataFrame()
 
-    expected_bm: set[str] = set()
-    expected_dmsp: set[str] = set()
+    expected_bm: set[str] = {Path(patch.path).name for patch in bm_patches}
+    expected_dmsp: set[str] = {Path(match.dmsp_path).name for match in dmsp_matches}
     if "bm_patch" in manifest_df.columns:
-        expected_bm = {
+        expected_bm.update(
             Path(path).name
             for path in manifest_df["bm_patch"].dropna().astype(str)
-        }
+        )
     if "dmsp_patch" in manifest_df.columns:
-        expected_dmsp = {
+        expected_dmsp.update(
             Path(path).name
             for path in manifest_df["dmsp_patch"].dropna().astype(str)
-        }
+        )
 
     def iter_rasters(directory: Path) -> Iterable[Path]:
         seen: set[Path] = set()
@@ -1006,15 +1221,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     yield path
 
     bm_removed = 0
-    if BM_OUTPUT_DIR.exists():
-        for bm_path in iter_rasters(BM_OUTPUT_DIR):
+    if bm_dir.exists():
+        for bm_path in iter_rasters(bm_dir):
             if bm_path.name not in expected_bm:
                 bm_path.unlink(missing_ok=True)
                 bm_removed += 1
 
     dmsp_removed = 0
-    if DMSP_OUTPUT_DIR.exists():
-        for dmsp_path in iter_rasters(DMSP_OUTPUT_DIR):
+    if dmsp_dir.exists():
+        for dmsp_path in iter_rasters(dmsp_dir):
             if dmsp_path.name not in expected_dmsp:
                 dmsp_path.unlink(missing_ok=True)
                 dmsp_removed += 1

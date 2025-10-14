@@ -46,15 +46,21 @@ class _UnavailableFile:
 dummy_h5py.File = _UnavailableFile
 sys.modules.setdefault("h5py", dummy_h5py)
 
-dummy_numpy = types.ModuleType("numpy")
-dummy_numpy.float32 = float
-dummy_numpy.nan = float("nan")
-sys.modules.setdefault("numpy", dummy_numpy)
+try:  # pragma: no cover - exercised when numpy is available
+    import numpy  # noqa: F401
+except ImportError:  # pragma: no cover - optional dependency absent
+    dummy_numpy = types.ModuleType("numpy")
+    dummy_numpy.float32 = float
+    dummy_numpy.nan = float("nan")
+    sys.modules.setdefault("numpy", dummy_numpy)
 
-dummy_pandas = types.ModuleType("pandas")
-dummy_pandas.DataFrame = type("DataFrame", (), {})
-dummy_pandas.Series = type("Series", (), {})
-sys.modules.setdefault("pandas", dummy_pandas)
+try:  # pragma: no cover - exercised when pandas is available
+    import pandas  # noqa: F401
+except ImportError:  # pragma: no cover - optional dependency absent
+    dummy_pandas = types.ModuleType("pandas")
+    dummy_pandas.DataFrame = type("DataFrame", (), {})
+    dummy_pandas.Series = type("Series", (), {})
+    sys.modules.setdefault("pandas", dummy_pandas)
 
 dummy_rasterio = types.ModuleType("rasterio")
 
@@ -162,10 +168,18 @@ rasterio = data_sampler.rasterio
 
 
 class DummyResponse:
-    def __init__(self, status_code: int, payload: dict | None = None, raise_error: bool = False):
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict | None = None,
+        raise_error: bool = False,
+        content: bytes | None = None,
+    ):
         self.status_code = status_code
         self._payload = payload or {}
         self._raise_error = raise_error
+        self._content = content or b""
+        self.headers = {"Content-Length": str(len(self._content))}
 
     def raise_for_status(self):
         if self._raise_error or self.status_code >= 400:
@@ -173,6 +187,16 @@ class DummyResponse:
 
     def json(self):
         return self._payload
+
+    def iter_content(self, chunk_size=8192):
+        if not self._content:
+            yield from []
+            return
+        for start in range(0, len(self._content), chunk_size):
+            yield self._content[start : start + chunk_size]
+
+    def close(self):  # pragma: no cover - no resources to release
+        return None
 
 
 def test_search_nasa_cmr_handles_dateline_split(monkeypatch):
@@ -220,11 +244,25 @@ def test_process_samples_parallel_continues_after_failure(monkeypatch, tmp_path)
     def fake_worker(sample, *args, **kwargs):
         if sample["id"] == "fail":
             raise RuntimeError("boom")
-        return (f"ok {sample['id']}", tmp_path / f"{sample['id']}.tif")
+        patch_path = tmp_path / f"{sample['tile_id']}.tif"
+        return (
+            f"ok {sample['id']}",
+            data_sampler.BMPatch(
+                tile_id=sample["tile_id"],
+                path=patch_path,
+                longitude=0.0,
+                latitude=0.0,
+                date="2020-01-01",
+            ),
+        )
 
     monkeypatch.setattr(data_sampler, "process_single_sample", fake_worker)
 
-    samples = [{"id": "a"}, {"id": "fail"}, {"id": "b"}]
+    samples = [
+        {"id": "a", "tile_id": "tile_001"},
+        {"id": "fail", "tile_id": "tile_002"},
+        {"id": "b", "tile_id": "tile_003"},
+    ]
     results = data_sampler.process_samples_parallel(
         samples,
         patch_size_pix=10,
@@ -236,7 +274,189 @@ def test_process_samples_parallel_continues_after_failure(monkeypatch, tmp_path)
         max_workers=2,
     )
 
-    assert sorted(path.name for path in results) == ["a.tif", "b.tif"]
+    assert sorted(patch.tile_id for patch in results) == ["tile_001", "tile_003"]
+
+
+def test_safe_download_raises_download_error(monkeypatch, tmp_path):
+    class FakeS3:
+        def __init__(self):
+            self.calls = 0
+
+        def head_object(self, Bucket, Key):
+            return {"ContentLength": 1024}
+
+        def download_file(self, bucket, key, filename, Callback=None):
+            self.calls += 1
+            raise ValueError("network down")
+
+    fake_s3 = FakeS3()
+    monkeypatch.setattr(data_sampler, "tqdm", None)
+    monkeypatch.setattr(data_sampler.time, "sleep", lambda *_: None)
+
+    with pytest.raises(data_sampler.DownloadError) as excinfo:
+        data_sampler.safe_download(
+            fake_s3,
+            "bucket",
+            "object",
+            tmp_path / "out.bin",
+            max_retries=2,
+        )
+
+    assert "Failed to download" in str(excinfo.value)
+    assert fake_s3.calls == 2
+
+
+def test_select_best_dmsp_match_collects_download_failures(monkeypatch, tmp_path):
+    bm_path = tmp_path / "bm" / "tile_001.tif"
+    bm_path.parent.mkdir(parents=True, exist_ok=True)
+    bm_path.touch()
+
+    bm_patch = data_sampler.BMPatch(
+        tile_id="tile_001",
+        path=bm_path,
+        longitude=0.0,
+        latitude=0.0,
+        date="2020-01-01",
+    )
+
+    class FakeDataset:
+        def __init__(self):
+            self.profile = {
+                "height": 1,
+                "width": 1,
+                "transform": None,
+                "crs": None,
+            }
+            self.height = 1
+            self.width = 1
+
+        def read(self, *args, **kwargs):
+            import numpy as np
+
+            return np.ones((1, 1), dtype=np.float32)
+
+        def write(self, data, index):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_open(path, mode="r", **kwargs):
+        if mode == "w":
+            dataset = FakeDataset()
+
+            def write(data, index):
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_bytes(b"fake")
+
+            dataset.write = write  # type: ignore[attr-defined]
+            return dataset
+        return FakeDataset()
+
+    monkeypatch.setattr(data_sampler.rasterio, "open", fake_open)
+
+    def fake_safe_download(s3, bucket, key, outpath, max_retries=5):
+        raise data_sampler.DownloadError(bucket, key, max_retries, RuntimeError("oops"))
+
+    monkeypatch.setattr(data_sampler, "safe_download", fake_safe_download)
+
+    match, failures = data_sampler.select_best_dmsp_match(
+        bm_patch,
+        [("F101_example.vis.co.tif", None)],
+        s3=None,
+        bucket_name="bucket",
+        download_dir=tmp_path / "dl",
+        dmsp_out_dir=tmp_path / "dmsp",
+    )
+
+    assert match is None
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure.tile_id == "tile_001"
+    assert failure.key == "F101_example.vis.co.tif"
+
+
+def test_select_best_dmsp_match_uses_tile_id_for_outputs(monkeypatch, tmp_path):
+    bm_path = tmp_path / "bm" / "tile_002.tif"
+    bm_path.parent.mkdir(parents=True, exist_ok=True)
+    bm_path.touch()
+
+    bm_patch = data_sampler.BMPatch(
+        tile_id="tile_002",
+        path=bm_path,
+        longitude=0.0,
+        latitude=0.0,
+        date="2020-01-01",
+    )
+
+    class FakeDataset:
+        def __init__(self):
+            self.profile = {
+                "height": 1,
+                "width": 1,
+                "transform": None,
+                "crs": None,
+            }
+            self.height = 1
+            self.width = 1
+
+        def read(self, *args, **kwargs):
+            import numpy as np
+
+            return np.ones((1, 1), dtype=np.float32)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_open(path, mode="r", **kwargs):
+        dataset = FakeDataset()
+        if mode == "w":
+            def write(data, index):
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_bytes(b"fake")
+
+            dataset.write = write  # type: ignore[attr-defined]
+        return dataset
+
+    monkeypatch.setattr(data_sampler.rasterio, "open", fake_open)
+    monkeypatch.setattr(
+        data_sampler,
+        "reproject_to_bm_grid",
+        lambda *a, **k: __import__("numpy").ones((1, 1), dtype=float),
+    )
+    monkeypatch.setattr(data_sampler, "compute_patch_correlation", lambda *a, **k: 0.9)
+
+    def fake_safe_download(s3, bucket, key, outpath, max_retries=5):
+        outpath.parent.mkdir(parents=True, exist_ok=True)
+        outpath.write_bytes(b"data")
+        return outpath
+
+    monkeypatch.setattr(data_sampler, "safe_download", fake_safe_download)
+
+    download_dir = tmp_path / "dl"
+    dmsp_dir = tmp_path / "dmsp"
+
+    match, failures = data_sampler.select_best_dmsp_match(
+        bm_patch,
+        [("F141_example.vis.co.tif", None)],
+        s3=None,
+        bucket_name="bucket",
+        download_dir=download_dir,
+        dmsp_out_dir=dmsp_dir,
+    )
+
+    assert not failures
+    assert match is not None
+    assert match.dmsp_path.name == "tile_002.tif"
+    assert match.f_number == "F141"
+    assert match.source_key == "F141_example.vis.co.tif"
+    assert match.dmsp_path.exists()
 
 
 def test_build_bm_mosaic_skips_missing_tiles(monkeypatch, tmp_path):
