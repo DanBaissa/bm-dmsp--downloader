@@ -1,3 +1,4 @@
 .env
+Raw_NL_Data/
 replication/
 run_replication.ps1
