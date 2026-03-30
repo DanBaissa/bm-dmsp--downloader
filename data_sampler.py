@@ -610,7 +610,7 @@ def process_single_sample(
                     close = getattr(response, "close", None)
                     if callable(close):
                         close()
-        h5_paths.append(h5_path)
+            h5_paths.append(h5_path)
 
         mosaic_array, mosaic_transform, mosaic_profile = build_bm_mosaic_for_bbox(
             h5_paths, tile_shapefile
@@ -1199,7 +1199,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         except pd.errors.EmptyDataError:
             manifest_df = pd.DataFrame()
 
-    expected_bm: set[str] = {Path(patch.path).name for patch in bm_patches}
+    expected_bm: set[str] = set()
     expected_dmsp: set[str] = {Path(match.dmsp_path).name for match in dmsp_matches}
     if "bm_patch" in manifest_df.columns:
         expected_bm.update(
