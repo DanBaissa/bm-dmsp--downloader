@@ -58,6 +58,86 @@ Set `--sampling-seed` to reproduce the LandScan sample selection and `--date-see
 
 All command-line options can be viewed with `python data_sampler.py --help`.
 
+## Running on AWS EC2
+
+For a first pass, use EC2 rather than Lambda. This pipeline depends on native geospatial libraries (`rasterio`, `geopandas`, `GDAL`) and works more predictably on a normal Linux VM.
+
+### 1. Launch an Ubuntu EC2 instance
+
+An instance in the `t3.large` or `m6i.large` range is a reasonable starting point for a smoke test. For a large run, you will likely want a larger EBS volume than the default because the script writes:
+
+- sampled CSVs
+- Black Marble GeoTIFF patches
+- DMSP GeoTIFF patches
+- manifest files
+- temporary download artifacts
+
+### 2. Copy the repo, the `Data/` folder, and your `.env`
+
+From your local machine, copy the project to the instance. The important part is that the EC2 working tree keeps the same relative layout, because the script expects:
+
+- `Data/Global_2012/landscan-global-2012.tif`
+- `Data/Black_Marble_IDs/Black_Marble_World_tiles.shp`
+- `Data/World_Countries/World_Countries_Generalized.shp`
+- `.env` containing `NASA_TOKEN=...`
+
+Example with `scp`:
+
+```bash
+scp -i /path/to/key.pem -r bm-dmsp--downloader ubuntu@YOUR_EC2_PUBLIC_DNS:~/
+```
+
+### 3. Bootstrap the instance
+
+Once connected to EC2:
+
+```bash
+cd ~/bm-dmsp--downloader
+bash aws/bootstrap_ubuntu.sh
+source .venv/bin/activate
+```
+
+### 4. Run a small validation download
+
+This repo now includes a test runner that uses your existing `.env` and sets `samples per bin = 2`:
+
+```bash
+bash aws/run_test_download.sh
+```
+
+That writes outputs under `ec2_test_run/`.
+
+If you want to kick off the EC2 test from your Windows machine and then pull the results back automatically, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\aws\run_ec2_test_and_pull.ps1 -HostName YOUR_EC2_PUBLIC_DNS -KeyPath C:\path\to\key.pem
+```
+
+That script will:
+
+- upload `data_sampler.py`, `requirements.txt`, `.env`, `aws/`, and `Data/`
+- bootstrap the Ubuntu instance
+- run the test download with `--samples-per-bin 2 --patch-size 1000 --max-workers 2 --output-folder ec2_test_run`
+- copy `ec2_test_run/` back to your local repo root
+
+### 5. Run the larger job after the test passes
+
+```bash
+bash aws/run_full_download.sh
+```
+
+That writes outputs under `ec2_full_run/`.
+
+The full-run helper is configured for `--samples-per-bin 2000`.
+
+From Windows, you can launch that job on EC2 and pull the results back with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\aws\run_ec2_full_and_pull.ps1 -HostName YOUR_EC2_PUBLIC_DNS -KeyPath C:\path\to\key.pem
+```
+
+If you want a different output directory, worker count, or seeds, edit the shell script or run `python data_sampler.py` directly.
+
 ## Testing
 
 The regression checks live in `tests/test_data_sampler.py`. The module stubs out heavyweight dependencies (e.g., `rasterio`, `geopandas`, `boto3`) so the suite can exercise the downloader’s control flow—dateline-aware CMR queries, worker failure handling, and missing tile metadata—without needing the full geospatial stack. Run the tests with:
