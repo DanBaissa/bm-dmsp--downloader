@@ -89,6 +89,7 @@ class BMPatch:
     longitude: float
     latitude: float
     date: str
+    population_bin: str | None = None
 
 
 @dataclass
@@ -644,7 +645,14 @@ def process_single_sample(
 
     return (
         f"Saved mosaic patch: {out_path}",
-        BMPatch(tile_id=tile_id, path=out_path, longitude=lon, latitude=lat, date=date_str),
+        BMPatch(
+            tile_id=tile_id,
+            path=out_path,
+            longitude=lon,
+            latitude=lat,
+            date=date_str,
+            population_bin=sample.get("Bin"),
+        ),
     )
 
 
@@ -1015,6 +1023,7 @@ def create_pair_manifest(
                 "tile_id": match.tile_id,
                 "bm_patch": str(bm_patch.path),
                 "dmsp_patch": str(match.dmsp_path),
+                "population_bin": bm_patch.population_bin,
                 "longitude": bm_patch.longitude,
                 "latitude": bm_patch.latitude,
                 "date": bm_patch.date,
@@ -1142,7 +1151,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     dmsp_dates = list_dmsp_dates()
     df = assign_random_dates(df, dmsp_dates, seed=args.date_seed)
-    base_samples = df[["Longitude", "Latitude", "date"]].to_dict(orient="records")
+    sample_columns = ["Longitude", "Latitude", "date"]
+    if "Bin" in df.columns:
+        sample_columns.append("Bin")
+    base_samples = df[sample_columns].to_dict(orient="records")
     sample_list = []
     for idx, sample in enumerate(base_samples, start=1):
         tile_id = f"tile_{idx:03d}"
