@@ -1,0 +1,15 @@
+# Runtime dependencies used by data_sampler.py
+boto3
+botocore
+geopandas
+h5py
+matplotlib
+numpy
+pandas
+python-dotenv
+rasterio
+requests
+tqdm
+
+# Test dependency used by tests/test_data_sampler.py
+pytest
