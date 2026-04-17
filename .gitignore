@@ -4,3 +4,4 @@ replication/
 run_replication.ps1
 ec2_test_run_from_ec2/
 ec2_full_run_from_ec2/
+aws/
