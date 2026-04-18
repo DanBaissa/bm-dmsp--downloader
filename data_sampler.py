@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import concurrent.futures
+import hashlib
+import json
 import logging
 import math
 import os
 import random
 import re
 import shutil
+import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
@@ -27,7 +31,6 @@ import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
-from rasterio.io import MemoryFile
 from rasterio.merge import merge as rio_merge
 from rasterio.transform import from_bounds as rio_from_bounds
 from rasterio.warp import reproject, Resampling as WarpResampling
@@ -55,14 +58,26 @@ DEFAULT_COLLECTION_ID = "C3365931269-LAADS"
 DEFAULT_TILE_SHAPEFILE = Path("Data/Black_Marble_IDs/Black_Marble_World_tiles.shp")
 LANDSCAN_RASTER = Path("Data/Global_2012/landscan-global-2012.tif")
 COUNTRIES_SHP = Path("Data/World_Countries/World_Countries_Generalized.shp")
+DEFAULT_DMSP_DATES_CACHE = Path(".dmsp_dates_cache.txt")
+DEFAULT_CACHE_ROOT = Path(".cache")
+BM_GRANULE_CACHE_DIRNAME = "bm_granules"
+DMSP_RAW_CACHE_DIRNAME = "dmsp_raw"
+BM_CMR_CACHE_DIRNAME = "bm_cmr"
+BM_GEOTIFF_CACHE_DIRNAME = "bm_geotiff"
+DMSP_SCENE_INDEX_DIRNAME = "dmsp_scene_index"
 PAIR_OUTPUT_ROOT = Path("Raw_NL_Data")
 BM_OUTPUT_DIR = PAIR_OUTPUT_ROOT / "bm"
 DMSP_OUTPUT_DIR = PAIR_OUTPUT_ROOT / "dmsp"
 PLOTS_DIR = Path("plots")
 DEFAULT_LOCATIONS_CSV = Path("sampled_locations.csv")
 DEFAULT_MANIFEST = Path("Raw_NL_Data/bm_dmsp_pairs.csv")
+TIMINGS_FILENAME = "timings.json"
 NOMINAL_DEG_PER_PX = 15.0 / 3600.0
 BM_DATASET_PATH = "/HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields/Gap_Filled_DNB_BRDF-Corrected_NTL"
+HTTP_POOL_SIZE = 16
+DMSP_BUCKET_NAME = "globalnightlight"
+DMSP_SATELLITES = tuple(f"F{n}" for n in range(10, 19))
+_HTTP_SESSION_LOCAL = threading.local()
 
 
 class TileMetadataMissingError(RuntimeError):
@@ -111,6 +126,70 @@ class DownloadFailure:
     error: Exception
 
 
+@dataclass
+class RunMetrics:
+    counts: dict[str, int] = field(default_factory=dict)
+    bytes_downloaded: dict[str, int] = field(default_factory=dict)
+    cache_hits: dict[str, int] = field(default_factory=dict)
+    cache_misses: dict[str, int] = field(default_factory=dict)
+    stage_seconds: dict[str, float] = field(default_factory=dict)
+    metadata: dict[str, object] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def set_metadata(self, key: str, value: object) -> None:
+        with self._lock:
+            self.metadata[key] = value
+
+    def set_count(self, name: str, value: int) -> None:
+        with self._lock:
+            self.counts[name] = int(value)
+
+    def increment_count(self, name: str, amount: int = 1) -> None:
+        with self._lock:
+            self.counts[name] = self.counts.get(name, 0) + int(amount)
+
+    def add_bytes(self, name: str, amount: int) -> None:
+        with self._lock:
+            self.bytes_downloaded[name] = self.bytes_downloaded.get(name, 0) + int(amount)
+
+    def record_cache_hit(self, name: str) -> None:
+        with self._lock:
+            self.cache_hits[name] = self.cache_hits.get(name, 0) + 1
+
+    def record_cache_miss(self, name: str) -> None:
+        with self._lock:
+            self.cache_misses[name] = self.cache_misses.get(name, 0) + 1
+
+    def add_stage_time(self, stage: str, elapsed_seconds: float) -> None:
+        with self._lock:
+            self.stage_seconds[stage] = self.stage_seconds.get(stage, 0.0) + float(
+                elapsed_seconds
+            )
+
+    @contextmanager
+    def measure(self, stage: str):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add_stage_time(stage, time.perf_counter() - start)
+
+    def write(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            payload = {
+                "counts": dict(sorted(self.counts.items())),
+                "bytes_downloaded": dict(sorted(self.bytes_downloaded.items())),
+                "cache_hits": dict(sorted(self.cache_hits.items())),
+                "cache_misses": dict(sorted(self.cache_misses.items())),
+                "stage_seconds": {
+                    key: round(value, 6) for key, value in sorted(self.stage_seconds.items())
+                },
+                "metadata": dict(sorted(self.metadata.items())),
+            }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 @contextmanager
 def _progress_bar(total: int | None, description: str):
     if tqdm is None:
@@ -123,7 +202,7 @@ def _progress_bar(total: int | None, description: str):
         bar.close()
 
 
-def _write_response_to_file(response, destination: Path, description: str) -> None:
+def _write_response_to_file(response, destination: Path, description: str) -> int:
     chunk_size = 1024 * 128
     total_header = response.headers.get("Content-Length") if hasattr(response, "headers") else None
     total: int | None = None
@@ -132,14 +211,111 @@ def _write_response_to_file(response, destination: Path, description: str) -> No
             total = int(total_header)
         except (TypeError, ValueError):  # pragma: no cover - malformed header
             total = None
+    bytes_written = 0
     with destination.open("wb") as fh:
         with _progress_bar(total, description) as bar:
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if not chunk:
                     continue
                 fh.write(chunk)
+                bytes_written += len(chunk)
                 if bar is not None:
                     bar.update(len(chunk))
+    return bytes_written
+
+
+def build_http_session():
+    session_factory = getattr(requests, "Session", None)
+    if session_factory is None:  # pragma: no cover - exercised only in lightweight tests
+        return None
+
+    session = session_factory()
+    try:  # pragma: no cover - adapters may be unavailable in lightweight tests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        retry = Retry(
+            total=5,
+            connect=5,
+            read=5,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry,
+            pool_connections=HTTP_POOL_SIZE,
+            pool_maxsize=HTTP_POOL_SIZE,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+    except Exception:
+        pass
+    return session
+
+
+def get_http_session():
+    session = getattr(_HTTP_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = build_http_session()
+        _HTTP_SESSION_LOCAL.session = session
+    return session
+
+
+def materialize_cached_file(
+    target_path: Path,
+    writer,
+    wait_timeout: float = 1800.0,
+    poll_interval: float = 0.25,
+) -> Path:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.exists():
+        return target_path
+
+    lock_path = target_path.with_name(f"{target_path.name}.lock")
+    start = time.time()
+    while True:
+        if target_path.exists():
+            return target_path
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            if time.time() - start > wait_timeout:
+                raise TimeoutError(f"Timed out waiting for cached file {target_path}")
+            time.sleep(poll_interval)
+
+    temp_path = target_path.with_name(
+        f"{target_path.name}.{os.getpid()}.{threading.get_ident()}.part"
+    )
+    try:
+        if target_path.exists():
+            return target_path
+        writer(temp_path)
+        os.replace(temp_path, target_path)
+        return target_path
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(lock_fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def build_s3_client(max_workers: int = 4):
+    pool_size = max(HTTP_POOL_SIZE, max_workers * 4)
+    try:
+        config = Config(signature_version=UNSIGNED, max_pool_connections=pool_size)
+    except TypeError:  # pragma: no cover - lightweight tests may stub Config loosely
+        try:
+            config = Config(signature_version=UNSIGNED)
+        except TypeError:
+            config = None
+    return boto3.client("s3", config=config)
 
 
 def infer_country_column(gdf: gpd.GeoDataFrame, country_column: str | None = None) -> str:
@@ -304,12 +480,11 @@ def sample_landscan_population(
 
 def list_dmsp_dates(min_date: pd.Timestamp | None = None) -> List[str]:
     min_dt = min_date or pd.Timestamp(2012, 1, 20)
-    s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
-    bucket_name = "globalnightlight"
+    s3 = build_s3_client()
     prefix = "F"
     paginator = s3.get_paginator("list_objects_v2")
     all_dates: set[str] = set()
-    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+    for page in paginator.paginate(Bucket=DMSP_BUCKET_NAME, Prefix=prefix):
         for obj in page.get("Contents", []):
             file_key = obj["Key"]
             if not file_key.endswith(".vis.co.tif"):
@@ -325,6 +500,138 @@ def list_dmsp_dates(min_date: pd.Timestamp | None = None) -> List[str]:
             if group_date >= min_dt:
                 all_dates.add(date_str)
     return sorted(all_dates)
+
+
+def _serialize_scene_entries(scene_entries: Sequence[tuple[str, int | None]]) -> List[dict[str, object]]:
+    return [{"key": key, "size": size} for key, size in scene_entries]
+
+
+def _deserialize_scene_entries(entries: Sequence[dict[str, object]]) -> List[tuple[str, int | None]]:
+    scene_entries: List[tuple[str, int | None]] = []
+    for entry in entries:
+        key = str(entry.get("key", ""))
+        if not key:
+            continue
+        size = entry.get("size")
+        scene_entries.append((key, int(size) if size is not None else None))
+    return scene_entries
+
+
+def load_dmsp_year_scene_index(
+    year: str,
+    s3,
+    bucket_name: str,
+    cache_dir: Path,
+    metrics: RunMetrics | None = None,
+) -> dict[str, List[tuple[str, int | None]]]:
+    cache_path = cache_dir / f"{year}.json"
+    if cache_path.exists():
+        if metrics is not None:
+            metrics.record_cache_hit("dmsp_scene_index")
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            dates = payload.get("dates", {})
+            if isinstance(dates, dict):
+                return {
+                    str(date_key): _deserialize_scene_entries(scene_entries)
+                    for date_key, scene_entries in dates.items()
+                }
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            LOGGER.warning("Failed to read cached DMSP scene index %s; rebuilding", cache_path)
+
+    if metrics is not None:
+        metrics.record_cache_miss("dmsp_scene_index")
+
+    scenes_by_date: defaultdict[str, List[tuple[str, int | None]]] = defaultdict(list)
+    for sat in DMSP_SATELLITES:
+        prefix = f"{sat}{year}/"
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(".vis.co.tif"):
+                    continue
+                fname = os.path.basename(key)
+                if len(fname) < 11:
+                    continue
+                date_str = fname[3:11]
+                if not date_str.startswith(year):
+                    continue
+                scenes_by_date[date_str].append((key, obj.get("Size")))
+
+    payload = {
+        "year": year,
+        "dates": {
+            date_key: _serialize_scene_entries(sorted(scene_entries))
+            for date_key, scene_entries in sorted(scenes_by_date.items())
+        },
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {date_key: list(scene_entries) for date_key, scene_entries in scenes_by_date.items()}
+
+
+def list_dmsp_scene_keys_for_dates(
+    dmsp_date_strs: Sequence[str],
+    s3,
+    bucket_name: str,
+    cache_dir: Path,
+    metrics: RunMetrics | None = None,
+) -> dict[str, List[tuple[str, int | None]]]:
+    unique_dates = sorted({date_str for date_str in dmsp_date_strs if date_str})
+    indices_by_year = {
+        year: load_dmsp_year_scene_index(year, s3, bucket_name, cache_dir, metrics=metrics)
+        for year in sorted({date_str[:4] for date_str in unique_dates})
+    }
+    return {
+        date_str: list(indices_by_year.get(date_str[:4], {}).get(date_str, []))
+        for date_str in unique_dates
+    }
+
+
+def list_dmsp_scene_keys_for_date(
+    dmsp_date_str: str,
+    s3,
+    bucket_name: str,
+    cache_dir: Path | None = None,
+    metrics: RunMetrics | None = None,
+) -> List[tuple[str, int | None]]:
+    resolved_cache_dir = cache_dir or (DEFAULT_CACHE_ROOT / DMSP_SCENE_INDEX_DIRNAME)
+    return list(
+        list_dmsp_scene_keys_for_dates(
+            [dmsp_date_str],
+            s3,
+            bucket_name,
+            resolved_cache_dir,
+            metrics=metrics,
+        ).get(dmsp_date_str, [])
+    )
+
+
+def get_dmsp_dates(
+    cache_path: Path = DEFAULT_DMSP_DATES_CACHE,
+    min_date: pd.Timestamp | None = None,
+    metrics: RunMetrics | None = None,
+) -> List[str]:
+    if cache_path.exists():
+        if metrics is not None:
+            metrics.record_cache_hit("dmsp_dates")
+        cached_dates = [
+            line.strip()
+            for line in cache_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if cached_dates:
+            LOGGER.info("Loaded %s cached DMSP dates from %s", len(cached_dates), cache_path)
+            return cached_dates
+
+    if metrics is not None:
+        metrics.record_cache_miss("dmsp_dates")
+    dates = list_dmsp_dates(min_date=min_date)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text("\n".join(dates) + "\n", encoding="utf-8")
+    LOGGER.info("Cached %s DMSP dates to %s", len(dates), cache_path)
+    return dates
 
 
 def assign_random_dates(df: pd.DataFrame, dmsp_dates: Sequence[str], seed: int = 13492) -> pd.DataFrame:
@@ -381,7 +688,13 @@ def _normalize_bbox(bbox: Sequence[float]) -> List[List[float]]:
     return [first, second]
 
 
-def search_nasa_cmr(collection_id: str, date_str: str, bbox: Sequence[float]) -> List[str]:
+def search_nasa_cmr(
+    collection_id: str,
+    date_str: str,
+    bbox: Sequence[float],
+    session=None,
+) -> List[str]:
+    session = session or get_http_session()
     segments = _normalize_bbox(bbox)
     seen: set[str] = set()
     results: List[str] = []
@@ -393,7 +706,7 @@ def search_nasa_cmr(collection_id: str, date_str: str, bbox: Sequence[float]) ->
             "page_size": 50,
         }
         try:
-            response = requests.get(
+            response = session.get(
                 "https://cmr.earthdata.nasa.gov/search/granules.json",
                 params=params,
                 timeout=30,
@@ -420,14 +733,144 @@ def search_nasa_cmr(collection_id: str, date_str: str, bbox: Sequence[float]) ->
     return results
 
 
-def h5_to_geotiff(h5_path: Path, tile_shapefile_gdf: gpd.GeoDataFrame) -> Path:
+def bounds_intersect(
+    bounds_a: Sequence[float],
+    bounds_b: Sequence[float],
+) -> bool:
+    left_a, bottom_a, right_a, top_a = bounds_a
+    left_b, bottom_b, right_b, top_b = bounds_b
+    return not (
+        right_a < left_b
+        or right_b < left_a
+        or top_a < bottom_b
+        or top_b < bottom_a
+    )
+
+
+def find_bm_tile_ids_for_bbox(
+    bbox: Sequence[float],
+    tile_bounds_lookup: dict[str, tuple[float, float, float, float]],
+) -> List[str]:
+    segments = _normalize_bbox(bbox)
+    return sorted(
+        tile_id
+        for tile_id, tile_bounds in tile_bounds_lookup.items()
+        if any(bounds_intersect(tile_bounds, segment) for segment in segments)
+    )
+
+
+def filter_cmr_urls_for_tile_ids(
+    urls: Sequence[str],
+    required_tile_ids: Sequence[str],
+) -> List[str]:
+    if not required_tile_ids:
+        return list(urls)
+
+    required = set(required_tile_ids)
+    filtered = [
+        url
+        for url in urls
+        if (match := re.search(r"h\d{2}v\d{2}", url)) is not None and match.group() in required
+    ]
+    if filtered:
+        return filtered
+    LOGGER.warning(
+        "CMR results did not match the required BM tile IDs %s; falling back to all returned URLs",
+        ", ".join(required_tile_ids),
+    )
+    return list(urls)
+
+
+def get_cached_bm_granule_urls(
+    collection_id: str,
+    date_str: str,
+    bbox: Sequence[float],
+    required_tile_ids: Sequence[str],
+    session,
+    cache_dir: Path,
+    metrics: RunMetrics | None = None,
+) -> List[str]:
+    cache_payload = {
+        "collection_id": collection_id,
+        "date": date_str,
+        "required_tile_ids": list(required_tile_ids),
+    }
+    digest = hashlib.sha256(
+        json.dumps(cache_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    cache_path = cache_dir / f"{date_str.replace('-', '')}_{digest}.json"
+    if cache_path.exists():
+        if metrics is not None:
+            metrics.record_cache_hit("bm_cmr")
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            urls = payload.get("urls", [])
+            if isinstance(urls, list):
+                return [str(url) for url in urls]
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            LOGGER.warning("Failed to read cached CMR response %s; rebuilding", cache_path)
+
+    if metrics is not None:
+        metrics.record_cache_miss("bm_cmr")
+        metrics.increment_count("bm_cmr_queries")
+    urls = search_nasa_cmr(collection_id, date_str, bbox, session=session)
+    filtered_urls = filter_cmr_urls_for_tile_ids(urls, required_tile_ids)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "collection_id": collection_id,
+                "date": date_str,
+                "required_tile_ids": list(required_tile_ids),
+                "urls": filtered_urls,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return filtered_urls
+
+
+def build_tile_bounds_lookup(
+    tile_shapefile_gdf: gpd.GeoDataFrame,
+) -> dict[str, tuple[float, float, float, float]]:
+    if "TileID" not in tile_shapefile_gdf.columns:
+        raise ValueError("Black Marble tile shapefile is missing the TileID column")
+    lookup: dict[str, tuple[float, float, float, float]] = {}
+    for row in tile_shapefile_gdf[["TileID", "geometry"]].itertuples(index=False):
+        geometry = getattr(row, "geometry", None)
+        if geometry is None:
+            continue
+        lookup[str(row.TileID)] = tuple(float(value) for value in geometry.bounds)
+    return lookup
+
+
+def h5_to_geotiff(
+    h5_path: Path,
+    tile_bounds_lookup: dict[str, tuple[float, float, float, float]],
+    out_path: Path | None = None,
+) -> Path:
     """Convert a Black Marble granule HDF5 file into a temporary GeoTIFF."""
 
+    bounds: tuple[float, float, float, float] | None = None
     with h5py.File(h5_path, "r") as h5_file:
         if BM_DATASET_PATH not in h5_file:
             raise RuntimeError(f"Dataset not found in {h5_path.name}")
         dataset = h5_file[BM_DATASET_PATH]
         data = dataset[...].astype(np.float32)
+        west = h5_file.attrs.get("WestBoundingCoord")
+        east = h5_file.attrs.get("EastBoundingCoord")
+        south = h5_file.attrs.get("SouthBoundingCoord")
+        north = h5_file.attrs.get("NorthBoundingCoord")
+        if all(value is not None for value in (west, east, south, north)):
+            bounds = (
+                float(np.asarray(west).reshape(-1)[0]),
+                float(np.asarray(south).reshape(-1)[0]),
+                float(np.asarray(east).reshape(-1)[0]),
+                float(np.asarray(north).reshape(-1)[0]),
+            )
 
         for attr in ("_FillValue", "missing_value", "MissingValue"):
             value = dataset.attrs.get(attr)
@@ -440,16 +883,18 @@ def h5_to_geotiff(h5_path: Path, tile_shapefile_gdf: gpd.GeoDataFrame) -> Path:
 
         data[data < 0] = np.nan
 
-    tile_match = re.search(r"h\d{2}v\d{2}", h5_path.name)
-    if not tile_match:
-        raise RuntimeError(f"Could not determine tile ID for {h5_path.name}")
-    tile_id = tile_match.group()
-    bounds_row = tile_shapefile_gdf[tile_shapefile_gdf["TileID"] == tile_id]
-    if bounds_row.empty:
-        raise TileMetadataMissingError(f"Tile ID {tile_id} not found in shapefile")
-    left, bottom, right, top = bounds_row.total_bounds
+    if bounds is None:
+        tile_match = re.search(r"h\d{2}v\d{2}", h5_path.name)
+        if not tile_match:
+            raise RuntimeError(f"Could not determine tile ID for {h5_path.name}")
+        tile_id = tile_match.group()
+        bounds = tile_bounds_lookup.get(tile_id)
+        if bounds is None:
+            raise TileMetadataMissingError(f"Tile ID {tile_id} not found in shapefile")
+    left, bottom, right, top = bounds
 
-    tif_path = h5_path.with_suffix(".tif")
+    tif_path = out_path if out_path is not None else h5_path.with_suffix(".tif")
+    tif_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(
         tif_path,
         "w",
@@ -469,7 +914,10 @@ def h5_to_geotiff(h5_path: Path, tile_shapefile_gdf: gpd.GeoDataFrame) -> Path:
 
 def build_bm_mosaic_for_bbox(
     h5_paths: List[Path],
-    tile_shapefile_gdf: gpd.GeoDataFrame,
+    tile_bounds_lookup: dict[str, tuple[float, float, float, float]],
+    bbox: Sequence[float] | None = None,
+    geotiff_cache_dir: Path | None = None,
+    metrics: RunMetrics | None = None,
 ) -> tuple[np.ndarray, rasterio.Affine, dict]:
     """Mosaic all tiles intersecting the target bbox into a single raster."""
 
@@ -477,7 +925,25 @@ def build_bm_mosaic_for_bbox(
     try:
         for h5_path in h5_paths:
             try:
-                tif_paths.append(h5_to_geotiff(h5_path, tile_shapefile_gdf))
+                if geotiff_cache_dir is None:
+                    tif_paths.append(h5_to_geotiff(h5_path, tile_bounds_lookup))
+                else:
+                    tif_path = geotiff_cache_dir / f"{h5_path.stem}.geo.tif"
+                    if tif_path.exists():
+                        if metrics is not None:
+                            metrics.record_cache_hit("bm_geotiff")
+                    else:
+                        if metrics is not None:
+                            metrics.record_cache_miss("bm_geotiff")
+                        tif_path = materialize_cached_file(
+                            tif_path,
+                            lambda temp_path, source_path=h5_path: h5_to_geotiff(
+                                source_path,
+                                tile_bounds_lookup,
+                                out_path=temp_path,
+                            ),
+                        )
+                    tif_paths.append(tif_path)
             except TileMetadataMissingError as exc:
                 LOGGER.warning("Skipping %s: %s", h5_path.name, exc)
             except RuntimeError:
@@ -490,7 +956,10 @@ def build_bm_mosaic_for_bbox(
         try:
             for tif_path in tif_paths:
                 datasets.append(rasterio.open(tif_path))
-            mosaic, transform = rio_merge(datasets, nodata=np.nan)
+            merge_kwargs = {"nodata": np.nan}
+            if bbox is not None and bbox[0] <= bbox[2]:
+                merge_kwargs["bounds"] = tuple(float(value) for value in bbox)
+            mosaic, transform = rio_merge(datasets, **merge_kwargs)
             if mosaic.shape[0] != 1:
                 raise RuntimeError("Expected a single-band mosaic")
             mosaic_array = mosaic[0].astype(np.float32, copy=False)
@@ -510,8 +979,9 @@ def build_bm_mosaic_for_bbox(
             for dataset in datasets:
                 dataset.close()
     finally:
-        for tif_path in tif_paths:
-            tif_path.unlink(missing_ok=True)
+        if geotiff_cache_dir is None:
+            for tif_path in tif_paths:
+                tif_path.unlink(missing_ok=True)
 
     return mosaic_array, transform, profile
 
@@ -524,33 +994,24 @@ def crop_mosaic_to_bbox(
 ) -> tuple[np.ndarray, rasterio.Affine]:
     """Crop the mosaic to the requested square bounding box."""
 
-    profile = {
-        "driver": "GTiff",
-        "height": mosaic_array.shape[0],
-        "width": mosaic_array.shape[1],
-        "count": 1,
-        "dtype": "float32",
-        "crs": "EPSG:4326",
-        "transform": mosaic_transform,
-        "nodata": np.nan,
-    }
+    window = rasterio.windows.from_bounds(*bbox, transform=mosaic_transform)
+    window = window.round_offsets().round_lengths()
+    desired_window = rasterio.windows.Window(
+        col_off=int(round(window.col_off)),
+        row_off=int(round(window.row_off)),
+        width=patch_size_pix,
+        height=patch_size_pix,
+    )
+    full_window = rasterio.windows.Window(0, 0, mosaic_array.shape[1], mosaic_array.shape[0])
+    intersection = desired_window.intersection(full_window)
+    if intersection.width <= 0 or intersection.height <= 0:
+        raise RuntimeError(f"Mosaic does not cover bbox {bbox}")
 
-    with MemoryFile() as memfile:
-        with memfile.open(**profile) as dataset:
-            dataset.write(mosaic_array, 1)
-            window = rasterio.windows.from_bounds(*bbox, transform=dataset.transform)
-            window = window.round_offsets().round_lengths()
-            desired_window = rasterio.windows.Window(
-                col_off=int(round(window.col_off)),
-                row_off=int(round(window.row_off)),
-                width=patch_size_pix,
-                height=patch_size_pix,
-            )
-            full_window = rasterio.windows.Window(0, 0, dataset.width, dataset.height)
-            intersection = desired_window.intersection(full_window)
-            if intersection.width <= 0 or intersection.height <= 0:
-                raise RuntimeError(f"Mosaic does not cover bbox {bbox}")
-            patch = dataset.read(1, window=intersection, boundless=False).astype(np.float32, copy=False)
+    row_start = int(round(intersection.row_off))
+    row_stop = row_start + int(round(intersection.height))
+    col_start = int(round(intersection.col_off))
+    col_stop = col_start + int(round(intersection.width))
+    patch = mosaic_array[row_start:row_stop, col_start:col_stop].astype(np.float32, copy=False)
 
     cropped = np.full((patch_size_pix, patch_size_pix), np.nan, dtype=np.float32)
     row_offset = int(round(intersection.row_off - desired_window.row_off))
@@ -560,7 +1021,7 @@ def crop_mosaic_to_bbox(
         col_offset : col_offset + patch.shape[1],
     ] = patch
 
-    patch_transform = rasterio.windows.transform(desired_window, profile["transform"])
+    patch_transform = rasterio.windows.transform(desired_window, mosaic_transform)
     return cropped, patch_transform
 
 
@@ -569,12 +1030,30 @@ def process_single_sample(
     patch_size_pix: int,
     collection_id: str,
     token: str,
-    tile_shapefile: gpd.GeoDataFrame,
+    tile_bounds_lookup: dict[str, tuple[float, float, float, float]],
     output_folder: Path,
-    temp_folder: Path,
+    bm_cache_dir: Path,
+    bm_cmr_cache_dir: Path,
+    bm_geotiff_cache_dir: Path,
+    metrics: RunMetrics | None = None,
 ) -> tuple[str, Path | None]:
     lon, lat, date_str = sample["Longitude"], sample["Latitude"], sample["date"]
     tile_id = sample["tile_id"]
+    out_path = output_folder / f"{tile_id}.tif"
+
+    if out_path.exists():
+        return (
+            f"Reusing existing BM patch: {out_path}",
+            BMPatch(
+                tile_id=tile_id,
+                path=out_path,
+                longitude=lon,
+                latitude=lat,
+                date=date_str,
+                population_bin=sample.get("Bin"),
+            ),
+        )
+
     if lat < -60:
         return (f"Skipping Antarctica sample at ({lon:.3f}, {lat:.3f})", None)
 
@@ -585,42 +1064,64 @@ def process_single_sample(
     if search_bbox[3] < -60:
         return (f"Skipping search below -60°S for bbox {bbox}", None)
 
-    urls = search_nasa_cmr(collection_id, date_str, search_bbox)
+    session = get_http_session()
+    required_tile_ids = find_bm_tile_ids_for_bbox(search_bbox, tile_bounds_lookup)
+    urls = get_cached_bm_granule_urls(
+        collection_id,
+        date_str,
+        search_bbox,
+        required_tile_ids,
+        session,
+        bm_cmr_cache_dir,
+        metrics=metrics,
+    )
     if not urls:
         return (f"No Black Marble granules found for {date_str} at ({lon:.3f}, {lat:.3f})", None)
-
-    sample_temp = temp_folder / f"{lon:.3f}_{lat:.3f}_{date_str.replace('-', '')}"
-    sample_temp.mkdir(parents=True, exist_ok=True)
 
     h5_paths: List[Path] = []
     try:
         headers = {"Authorization": f"Bearer {token}"}
         for url in urls:
-            h5_path = sample_temp / os.path.basename(url)
-            if not h5_path.exists():
+            h5_path = bm_cache_dir / os.path.basename(url)
+            if h5_path.exists():
+                if metrics is not None:
+                    metrics.record_cache_hit("bm_granules")
+            else:
+                if metrics is not None:
+                    metrics.record_cache_miss("bm_granules")
                 LOGGER.info("Downloading Black Marble granule %s for %s", url, tile_id)
-                response = requests.get(url, headers=headers, stream=True)
-                response.raise_for_status()
-                try:
-                    _write_response_to_file(
-                        response,
-                        h5_path,
-                        f"BM {tile_id}: {os.path.basename(url)}",
-                    )
-                finally:
-                    close = getattr(response, "close", None)
-                    if callable(close):
-                        close()
+
+                def writer(temp_path: Path, source_url=url):
+                    response = session.get(source_url, headers=headers, stream=True, timeout=120)
+                    response.raise_for_status()
+                    try:
+                        bytes_written = _write_response_to_file(
+                            response,
+                            temp_path,
+                            f"BM {tile_id}: {os.path.basename(source_url)}",
+                        )
+                        if metrics is not None:
+                            metrics.add_bytes("bm", bytes_written)
+                            metrics.increment_count("bm_granule_downloads")
+                    finally:
+                        close = getattr(response, "close", None)
+                        if callable(close):
+                            close()
+
+                h5_path = materialize_cached_file(h5_path, writer)
             h5_paths.append(h5_path)
 
         mosaic_array, mosaic_transform, mosaic_profile = build_bm_mosaic_for_bbox(
-            h5_paths, tile_shapefile
+            h5_paths,
+            tile_bounds_lookup,
+            bbox=bbox,
+            geotiff_cache_dir=bm_geotiff_cache_dir,
+            metrics=metrics,
         )
         patch, patch_transform = crop_mosaic_to_bbox(
             mosaic_array, mosaic_transform, bbox, patch_size_pix
         )
 
-        out_path = output_folder / f"{tile_id}.tif"
         profile = mosaic_profile.copy()
         profile.update(
             {
@@ -638,10 +1139,6 @@ def process_single_sample(
             "Error processing sample %s (%s, %s): %s", date_str, lon, lat, exc, exc_info=True
         )
         return (f"Failed to save patch for {date_str} at ({lon:.3f}, {lat:.3f}): {exc}", None)
-    finally:
-        for path in h5_paths:
-            path.unlink(missing_ok=True)
-        shutil.rmtree(sample_temp, ignore_errors=True)
 
     return (
         f"Saved mosaic patch: {out_path}",
@@ -663,12 +1160,18 @@ def process_samples_parallel(
     token: str,
     tile_shapefile_path: Path,
     output_folder: Path,
-    temp_folder: Path,
+    bm_cache_dir: Path,
+    bm_cmr_cache_dir: Path,
+    bm_geotiff_cache_dir: Path,
     max_workers: int = 4,
+    metrics: RunMetrics | None = None,
 ) -> List[BMPatch]:
     output_folder.mkdir(parents=True, exist_ok=True)
-    temp_folder.mkdir(parents=True, exist_ok=True)
+    bm_cache_dir.mkdir(parents=True, exist_ok=True)
+    bm_cmr_cache_dir.mkdir(parents=True, exist_ok=True)
+    bm_geotiff_cache_dir.mkdir(parents=True, exist_ok=True)
     tile_shapefile = gpd.read_file(tile_shapefile_path)
+    tile_bounds_lookup = build_tile_bounds_lookup(tile_shapefile)
 
     results: List[BMPatch] = []
     failures: list[tuple[dict, Exception]] = []
@@ -680,9 +1183,12 @@ def process_samples_parallel(
                 patch_size_pix,
                 collection_id,
                 token,
-                tile_shapefile,
+                tile_bounds_lookup,
                 output_folder,
-                temp_folder,
+                bm_cache_dir,
+                bm_cmr_cache_dir,
+                bm_geotiff_cache_dir,
+                metrics,
             ): sample
             for sample in sample_list
         }
@@ -703,7 +1209,6 @@ def process_samples_parallel(
     if failures:
         LOGGER.warning("Encountered %d failed samples", len(failures))
 
-    shutil.rmtree(temp_folder, ignore_errors=True)
     return results
 
 
@@ -721,9 +1226,16 @@ def wait_for_file_release(path: Path, timeout: float = 10.0) -> None:
             time.sleep(0.5)
 
 
-def safe_download(s3, bucket: str, key: str, outpath: Path, max_retries: int = 5) -> Path:
-    object_size: int | None = None
-    if tqdm is not None:
+def safe_download(
+    s3,
+    bucket: str,
+    key: str,
+    outpath: Path,
+    max_retries: int = 5,
+    object_size: int | None = None,
+    metrics: RunMetrics | None = None,
+) -> Path:
+    if tqdm is not None and object_size is None:
         try:
             head = s3.head_object(Bucket=bucket, Key=key)
             object_size = head.get("ContentLength")
@@ -756,6 +1268,13 @@ def safe_download(s3, bucket: str, key: str, outpath: Path, max_retries: int = 5
             else:
                 s3.download_file(bucket, key, str(outpath))
             wait_for_file_release(outpath)
+            if metrics is not None:
+                downloaded_size = object_size
+                if downloaded_size is None and outpath.exists():
+                    downloaded_size = outpath.stat().st_size
+                if downloaded_size is not None:
+                    metrics.add_bytes("dmsp", downloaded_size)
+                metrics.increment_count("dmsp_scene_downloads")
             return outpath
         except botocore.exceptions.EndpointConnectionError as exc:  # pragma: no cover - network
             last_error = exc
@@ -796,45 +1315,62 @@ def safe_download(s3, bucket: str, key: str, outpath: Path, max_retries: int = 5
 
 def reproject_to_bm_grid(src_path: Path, bm_profile: dict) -> np.ndarray:
     with rasterio.open(src_path) as src:
-        src_data = src.read(1).astype(np.float32)
-        src_data[src_data == 255] = np.nan
-        dst = np.empty((bm_profile["height"], bm_profile["width"]), dtype=np.float32)
+        src_nodata = src.nodata if src.nodata is not None else 255
+        dst = np.full((bm_profile["height"], bm_profile["width"]), np.nan, dtype=np.float32)
         reproject(
-            source=src_data,
+            source=rasterio.band(src, 1),
             destination=dst,
             src_transform=src.transform,
             src_crs=src.crs,
             dst_transform=bm_profile["transform"],
             dst_crs=bm_profile["crs"],
             resampling=WarpResampling.bilinear,
-            src_nodata=np.nan,
+            src_nodata=src_nodata,
             dst_nodata=np.nan,
         )
     return dst
 
 
-def compute_patch_correlation(bm_patch: np.ndarray, dmsp_patch: np.ndarray) -> float | None:
+def compute_patch_correlation_stats(
+    bm_patch: np.ndarray,
+    dmsp_patch: np.ndarray,
+) -> tuple[float | None, float]:
     mask = (~np.isnan(bm_patch)) & (~np.isnan(dmsp_patch))
-    if mask.sum() < 2:
-        return None
-    bm_vals = bm_patch[mask]
-    dmsp_vals = dmsp_patch[mask]
-    if np.std(bm_vals) == 0 or np.std(dmsp_vals) == 0:
-        return None
-    corr = np.corrcoef(bm_vals, dmsp_vals)[0, 1]
+    total_pixels = int(mask.size)
+    valid_pixels = int(mask.sum())
+    valid_fraction = (valid_pixels / total_pixels) if total_pixels else 0.0
+    if valid_pixels < 2:
+        return (None, valid_fraction)
+
+    bm_vals = bm_patch[mask].astype(np.float64, copy=False)
+    dmsp_vals = dmsp_patch[mask].astype(np.float64, copy=False)
+    bm_centered = bm_vals - bm_vals.mean()
+    dmsp_centered = dmsp_vals - dmsp_vals.mean()
+    denominator = math.sqrt(
+        float(np.dot(bm_centered, bm_centered)) * float(np.dot(dmsp_centered, dmsp_centered))
+    )
+    if denominator == 0:
+        return (None, valid_fraction)
+    corr = float(np.dot(bm_centered, dmsp_centered) / denominator)
     if np.isnan(corr):
-        return None
-    return float(corr)
+        return (None, valid_fraction)
+    return (corr, valid_fraction)
+
+
+def compute_patch_correlation(bm_patch: np.ndarray, dmsp_patch: np.ndarray) -> float | None:
+    corr, _ = compute_patch_correlation_stats(bm_patch, dmsp_patch)
+    return corr
 
 
 def select_best_dmsp_match(
     bm_patch: BMPatch,
-    file_keys: Sequence[tuple[str, None]],
+    file_keys: Sequence[tuple[str, int | None]],
     s3,
     bucket_name: str,
-    download_dir: Path,
+    raw_cache_dir: Path,
     dmsp_out_dir: Path,
     min_valid_fraction: float = 0.10,
+    metrics: RunMetrics | None = None,
 ) -> tuple[DMSPMatch | None, List[DownloadFailure]]:
     bm_patch_path = bm_patch.path
     bm_patch_name = bm_patch_path.name
@@ -844,7 +1380,6 @@ def select_best_dmsp_match(
         bm_patch_array = bm_src.read(1).astype(np.float32)
         bm_patch_array[bm_patch_array < 0] = np.nan
 
-    total_pixels = bm_shape[0] * bm_shape[1]
     best_corr = None
     best_vis_patch: np.ndarray | None = None
     best_vis_file: Path | None = None
@@ -853,14 +1388,29 @@ def select_best_dmsp_match(
     best_source_key = ""
     failures: List[DownloadFailure] = []
 
-    for vis_key, _ in file_keys:
+    for vis_key, object_size in file_keys:
         base = os.path.basename(vis_key)
         f_number = base.split("_")[0] if "_" in base else base[:3]
-        vis_file = download_dir / base
-        if not vis_file.exists():
+        vis_file = raw_cache_dir.joinpath(*vis_key.split("/"))
+        if vis_file.exists():
+            if metrics is not None:
+                metrics.record_cache_hit("dmsp_raw")
+        else:
+            if metrics is not None:
+                metrics.record_cache_miss("dmsp_raw")
             LOGGER.info("Downloading %s", vis_key)
             try:
-                safe_download(s3, bucket_name, vis_key, vis_file)
+                vis_file = materialize_cached_file(
+                    vis_file,
+                    lambda temp_path, key=vis_key, size=object_size: safe_download(
+                        s3,
+                        bucket_name,
+                        key,
+                        temp_path,
+                        object_size=size,
+                        metrics=metrics,
+                    ),
+                )
             except DownloadError as exc:
                 LOGGER.warning(
                     "Failed to download %s for tile %s: %s",
@@ -882,8 +1432,7 @@ def select_best_dmsp_match(
         except Exception as exc:  # pragma: no cover - reprojection failure
             LOGGER.warning("Error processing %s: %s", vis_file, exc)
             continue
-        valid_pixels = np.sum(~np.isnan(vis_patch))
-        valid_fraction = valid_pixels / total_pixels if total_pixels else 0
+        corr, valid_fraction = compute_patch_correlation_stats(bm_patch_array, vis_patch)
         if valid_fraction < min_valid_fraction:
             LOGGER.debug(
                 "Skipping %s for %s due to low coverage (%.2f%%)",
@@ -892,7 +1441,6 @@ def select_best_dmsp_match(
                 valid_fraction * 100,
             )
             continue
-        corr = compute_patch_correlation(bm_patch_array, vis_patch)
         if corr is None:
             LOGGER.debug("Unable to compute correlation for %s", base)
             continue
@@ -936,70 +1484,142 @@ def select_best_dmsp_match(
 
 def parallel_process_bm_patch(
     bm_patch: BMPatch,
+    file_keys: Sequence[tuple[str, int | None]],
     s3,
     bucket_name: str,
-    temp_dir: Path,
+    raw_cache_dir: Path,
     dmsp_out_dir: Path,
+    metrics: RunMetrics | None = None,
 ) -> tuple[List[DMSPMatch], List[DownloadFailure]]:
-    bm_patch_path = bm_patch.path
-    dmsp_date_str = bm_patch.date.replace("-", "")
-    satellites = [f"F{n}" for n in range(10, 19)]
-    file_keys: List[tuple[str, None]] = []
-    for sat in satellites:
-        prefix = f"{sat}{dmsp_date_str[:4]}/"
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if dmsp_date_str in key and key.endswith(".vis.co.tif"):
-                    file_keys.append((key, None))
     if not file_keys:
-        LOGGER.info("No DMSP scenes found for %s", bm_patch_path.name)
+        LOGGER.info("No DMSP scenes found for %s", bm_patch.path.name)
         return ([], [])
     match, failures = select_best_dmsp_match(
         bm_patch,
         file_keys,
         s3,
         bucket_name,
-        temp_dir,
+        raw_cache_dir,
         dmsp_out_dir,
+        metrics=metrics,
     )
-    shutil.rmtree(temp_dir, ignore_errors=True)
     return (([match] if match else []), failures)
+
+
+def load_existing_dmsp_matches(manifest_path: Path) -> dict[str, DMSPMatch]:
+    if not manifest_path.exists():
+        return {}
+    try:
+        manifest = pd.read_csv(manifest_path)
+    except pd.errors.EmptyDataError:
+        return {}
+
+    required_columns = {
+        "tile_id",
+        "bm_patch",
+        "dmsp_patch",
+        "f_number",
+        "correlation",
+        "valid_fraction",
+        "dmsp_source_key",
+    }
+    if not required_columns.issubset(manifest.columns):
+        return {}
+
+    existing: dict[str, DMSPMatch] = {}
+    for row in manifest.itertuples(index=False):
+        dmsp_path = Path(str(row.dmsp_patch))
+        if not dmsp_path.exists():
+            continue
+        try:
+            correlation = float(row.correlation)
+            valid_fraction = float(row.valid_fraction)
+        except (TypeError, ValueError):
+            continue
+        existing[str(row.tile_id)] = DMSPMatch(
+            tile_id=str(row.tile_id),
+            bm_path=Path(str(row.bm_patch)),
+            dmsp_path=dmsp_path,
+            f_number=str(row.f_number),
+            correlation=correlation,
+            valid_fraction=valid_fraction,
+            source_key=str(row.dmsp_source_key),
+        )
+    return existing
 
 
 def download_dmsp_matches(
     bm_patches: Sequence[BMPatch],
     dmsp_out_dir: Path,
-    temp_dir: Path,
+    raw_cache_dir: Path,
     max_workers: int = 4,
+    existing_matches: dict[str, DMSPMatch] | None = None,
+    scene_index_cache_dir: Path | None = None,
+    metrics: RunMetrics | None = None,
 ) -> tuple[List[DMSPMatch], List[DownloadFailure]]:
     dmsp_out_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
-    bucket_name = "globalnightlight"
+    raw_cache_dir.mkdir(parents=True, exist_ok=True)
+    resolved_scene_index_cache_dir = scene_index_cache_dir or (
+        DEFAULT_CACHE_ROOT / DMSP_SCENE_INDEX_DIRNAME
+    )
+    resolved_scene_index_cache_dir.mkdir(parents=True, exist_ok=True)
+    s3 = build_s3_client(max_workers=max_workers)
+    bucket_name = DMSP_BUCKET_NAME
     saved_matches: List[DMSPMatch] = []
     failures: List[DownloadFailure] = []
+
+    pending_patches: List[BMPatch] = []
+    for patch in bm_patches:
+        existing = existing_matches.get(patch.tile_id) if existing_matches else None
+        if existing is None or not existing.dmsp_path.exists():
+            pending_patches.append(patch)
+            continue
+        saved_matches.append(
+            DMSPMatch(
+                tile_id=patch.tile_id,
+                bm_path=patch.path,
+                dmsp_path=existing.dmsp_path,
+                f_number=existing.f_number,
+                correlation=existing.correlation,
+                valid_fraction=existing.valid_fraction,
+                source_key=existing.source_key,
+            )
+        )
+    if saved_matches:
+        LOGGER.info("Reusing %s existing DMSP matches from %s", len(saved_matches), dmsp_out_dir)
+    if not pending_patches:
+        return saved_matches, failures
+
+    unique_dates = sorted({patch.date.replace("-", "") for patch in pending_patches})
+    if metrics is not None:
+        metrics.set_count("dmsp_unique_dates", len(unique_dates))
+        metrics.set_count("dmsp_unique_years", len({date_str[:4] for date_str in unique_dates}))
+    file_keys_by_date = list_dmsp_scene_keys_for_dates(
+        unique_dates,
+        s3,
+        bucket_name,
+        resolved_scene_index_cache_dir,
+        metrics=metrics,
+    )
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
-        for patch in bm_patches:
-            patch_temp = temp_dir / patch.path.stem
-            patch_temp.mkdir(parents=True, exist_ok=True)
+        for patch in pending_patches:
             futures.append(
                 executor.submit(
                     parallel_process_bm_patch,
                     patch,
+                    file_keys_by_date.get(patch.date.replace("-", ""), []),
                     s3,
                     bucket_name,
-                    patch_temp,
+                    raw_cache_dir,
                     dmsp_out_dir,
+                    metrics,
                 )
             )
         for future in concurrent.futures.as_completed(futures):
             matches, download_failures = future.result()
             saved_matches.extend(matches)
             failures.extend(download_failures)
-    shutil.rmtree(temp_dir, ignore_errors=True)
     return saved_matches, failures
 
 
@@ -1072,9 +1692,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Root directory where BM, DMSP, plots, and CSV artifacts will be written",
     )
     parser.add_argument(
+        "--cache-root",
+        type=Path,
+        default=DEFAULT_CACHE_ROOT,
+        help="Shared cache directory for reusable BM and DMSP source files",
+    )
+    parser.add_argument(
         "--skip-sampling",
         action="store_true",
         help="Use the existing locations CSV instead of regenerating samples",
+    )
+    parser.add_argument(
+        "--sample-only",
+        action="store_true",
+        help="Generate or normalize the locations CSV and dates, then exit before BM/DMSP downloads",
     )
     parser.add_argument(
         "--sampling-seed",
@@ -1112,12 +1743,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
 
     output_root = args.output_folder.expanduser() if args.output_folder else None
+    cache_root = args.cache_root.expanduser()
 
     bm_dir = output_root / "bm" if output_root else BM_OUTPUT_DIR
     dmsp_dir = output_root / "dmsp" if output_root else DMSP_OUTPUT_DIR
     plots_dir = output_root / "plots" if output_root else PLOTS_DIR
-    temp_dir = output_root / "temp_dl" if output_root else Path("temp_dl")
-    dmsp_temp_dir = output_root / "DMSP_Raw_Temp" if output_root else Path("DMSP_Raw_Temp")
+    bm_cache_dir = cache_root / BM_GRANULE_CACHE_DIRNAME
+    bm_cmr_cache_dir = cache_root / BM_CMR_CACHE_DIRNAME
+    bm_geotiff_cache_dir = cache_root / BM_GEOTIFF_CACHE_DIRNAME
+    dmsp_raw_cache_dir = cache_root / DMSP_RAW_CACHE_DIRNAME
+    dmsp_scene_index_dir = cache_root / DMSP_SCENE_INDEX_DIRNAME
+    dmsp_dates_cache = cache_root / DEFAULT_DMSP_DATES_CACHE.name
+    timings_root = output_root if output_root else PAIR_OUTPUT_ROOT
+    timings_path = timings_root / TIMINGS_FILENAME
 
     locations_csv = resolve_cli_path(
         output_root,
@@ -1132,126 +1770,193 @@ def main(argv: Sequence[str] | None = None) -> None:
         DEFAULT_MANIFEST.name,
     )
 
-    if args.skip_sampling and not locations_csv.exists():
-        raise FileNotFoundError(f"--skip-sampling provided but {locations_csv} does not exist")
-
-    if args.skip_sampling:
-        if args.countries:
-            LOGGER.warning("--countries ignored because --skip-sampling was provided")
-        df = pd.read_csv(locations_csv)
-    else:
-        df = sample_landscan_population(
-            samples_per_bin=args.samples_per_bin,
-            random_seed=args.sampling_seed,
-            plots_dir=plots_dir,
-            output_csv=locations_csv,
-            countries=args.countries,
-            country_column=args.country_column,
-        )
-
-    dmsp_dates = list_dmsp_dates()
-    df = assign_random_dates(df, dmsp_dates, seed=args.date_seed)
-    sample_columns = ["Longitude", "Latitude", "date"]
-    if "Bin" in df.columns:
-        sample_columns.append("Bin")
-    base_samples = df[sample_columns].to_dict(orient="records")
-    sample_list = []
-    for idx, sample in enumerate(base_samples, start=1):
-        tile_id = f"tile_{idx:03d}"
-        enriched = dict(sample)
-        enriched["tile_id"] = tile_id
-        sample_list.append(enriched)
-
-    token = load_nasa_token()
-    bm_patches = process_samples_parallel(
-        sample_list=sample_list,
-        patch_size_pix=args.patch_size,
-        collection_id=args.collection_id,
-        token=token,
-        tile_shapefile_path=DEFAULT_TILE_SHAPEFILE,
-        output_folder=bm_dir,
-        temp_folder=temp_dir,
-        max_workers=args.max_workers,
+    metrics = RunMetrics()
+    metrics.set_metadata(
+        "parameters",
+        {
+            "cache_root": str(cache_root),
+            "collection_id": args.collection_id,
+            "locations_csv": str(locations_csv),
+            "manifest": str(manifest_path),
+            "max_workers": args.max_workers,
+            "output_folder": str(output_root) if output_root is not None else None,
+            "patch_size": args.patch_size,
+            "sample_only": args.sample_only,
+            "samples_per_bin": args.samples_per_bin,
+            "sampling_seed": args.sampling_seed,
+            "date_seed": args.date_seed,
+        },
     )
+    total_start = time.perf_counter()
 
-    dmsp_matches, download_failures = download_dmsp_matches(
-        bm_patches=bm_patches,
-        dmsp_out_dir=dmsp_dir,
-        temp_dir=dmsp_temp_dir,
-        max_workers=args.max_workers,
-    )
+    try:
+        if args.skip_sampling and not locations_csv.exists():
+            raise FileNotFoundError(f"--skip-sampling provided but {locations_csv} does not exist")
 
-    LOGGER.info(
-        "Downloaded %s BM patches and %s DMSP patches",
-        len(bm_patches),
-        len(dmsp_matches),
-    )
-    if download_failures:
-        failed_tiles = {failure.tile_id for failure in download_failures}
-        LOGGER.warning(
-            "Encountered %s download failures across %s tiles",
-            len(download_failures),
-            len(failed_tiles),
-        )
-        for failure in download_failures:
-            LOGGER.warning(
-                "Tile %s (%s) failed to download %s: %s",
-                failure.tile_id,
-                failure.bm_path.name,
-                failure.key,
-                failure.error,
+        with metrics.measure("sampling"):
+            if args.skip_sampling:
+                if args.countries:
+                    LOGGER.warning("--countries ignored because --skip-sampling was provided")
+                df = pd.read_csv(locations_csv)
+            else:
+                df = sample_landscan_population(
+                    samples_per_bin=args.samples_per_bin,
+                    random_seed=args.sampling_seed,
+                    plots_dir=plots_dir,
+                    output_csv=locations_csv,
+                    countries=args.countries,
+                    country_column=args.country_column,
+                )
+
+        if "date" not in df.columns:
+            with metrics.measure("date_assignment"):
+                dmsp_dates = get_dmsp_dates(cache_path=dmsp_dates_cache, metrics=metrics)
+                df = assign_random_dates(df, dmsp_dates, seed=args.date_seed)
+                locations_csv.parent.mkdir(parents=True, exist_ok=True)
+                df.to_csv(locations_csv, index=False)
+                LOGGER.info("Wrote sampled locations with dates to %s", locations_csv)
+        else:
+            df = df.copy()
+
+        metrics.set_count("sample_rows", len(df))
+        if "date" in df.columns:
+            metrics.set_count("dated_rows", int(df["date"].notna().sum()))
+            metrics.set_count("unique_dates", len({str(value) for value in df["date"].dropna()}))
+        else:
+            metrics.set_count("dated_rows", 0)
+            metrics.set_count("unique_dates", 0)
+
+        if args.sample_only:
+            LOGGER.info("Sample-only mode enabled; skipping BM and DMSP downloads")
+            return
+
+        sample_columns = ["Longitude", "Latitude", "date"]
+        if "Bin" in df.columns:
+            sample_columns.append("Bin")
+        base_samples = df[sample_columns].to_dict(orient="records")
+        sample_list = []
+        for idx, sample in enumerate(base_samples, start=1):
+            tile_id = f"tile_{idx:03d}"
+            enriched = dict(sample)
+            enriched["tile_id"] = tile_id
+            sample_list.append(enriched)
+        metrics.set_count("sample_tiles_requested", len(sample_list))
+
+        token = load_nasa_token()
+        with metrics.measure("bm_processing"):
+            bm_patches = process_samples_parallel(
+                sample_list=sample_list,
+                patch_size_pix=args.patch_size,
+                collection_id=args.collection_id,
+                token=token,
+                tile_shapefile_path=DEFAULT_TILE_SHAPEFILE,
+                output_folder=bm_dir,
+                bm_cache_dir=bm_cache_dir,
+                bm_cmr_cache_dir=bm_cmr_cache_dir,
+                bm_geotiff_cache_dir=bm_geotiff_cache_dir,
+                max_workers=args.max_workers,
+                metrics=metrics,
             )
+        metrics.set_count("bm_patches", len(bm_patches))
 
-    manifest = create_pair_manifest(bm_patches, dmsp_matches, manifest_path)
+        existing_dmsp_matches = load_existing_dmsp_matches(manifest_path)
+        metrics.set_count("existing_dmsp_matches", len(existing_dmsp_matches))
+        with metrics.measure("dmsp_processing"):
+            dmsp_matches, download_failures = download_dmsp_matches(
+                bm_patches=bm_patches,
+                dmsp_out_dir=dmsp_dir,
+                raw_cache_dir=dmsp_raw_cache_dir,
+                max_workers=args.max_workers,
+                existing_matches=existing_dmsp_matches,
+                scene_index_cache_dir=dmsp_scene_index_dir,
+                metrics=metrics,
+            )
+        metrics.set_count("dmsp_matches", len(dmsp_matches))
+        metrics.set_count("download_failures", len(download_failures))
 
-    manifest_df = manifest
-    if manifest_path.exists():
-        try:
-            manifest_df = pd.read_csv(manifest_path)
-        except pd.errors.EmptyDataError:
-            manifest_df = pd.DataFrame()
-
-    expected_bm: set[str] = set()
-    expected_dmsp: set[str] = {Path(match.dmsp_path).name for match in dmsp_matches}
-    if "bm_patch" in manifest_df.columns:
-        expected_bm.update(
-            Path(path).name
-            for path in manifest_df["bm_patch"].dropna().astype(str)
-        )
-    if "dmsp_patch" in manifest_df.columns:
-        expected_dmsp.update(
-            Path(path).name
-            for path in manifest_df["dmsp_patch"].dropna().astype(str)
-        )
-
-    def iter_rasters(directory: Path) -> Iterable[Path]:
-        seen: set[Path] = set()
-        for pattern in ("*.tif", "*.TIF"):
-            for path in directory.glob(pattern):
-                if path not in seen:
-                    seen.add(path)
-                    yield path
-
-    bm_removed = 0
-    if bm_dir.exists():
-        for bm_path in iter_rasters(bm_dir):
-            if bm_path.name not in expected_bm:
-                bm_path.unlink(missing_ok=True)
-                bm_removed += 1
-
-    dmsp_removed = 0
-    if dmsp_dir.exists():
-        for dmsp_path in iter_rasters(dmsp_dir):
-            if dmsp_path.name not in expected_dmsp:
-                dmsp_path.unlink(missing_ok=True)
-                dmsp_removed += 1
-
-    if bm_removed or dmsp_removed:
         LOGGER.info(
-            "Removed %s unmatched BM rasters and %s unmatched DMSP rasters", bm_removed, dmsp_removed
+            "Downloaded %s BM patches and %s DMSP patches",
+            len(bm_patches),
+            len(dmsp_matches),
         )
-    else:
-        LOGGER.info("No unmatched BM or DMSP rasters were removed")
+        if download_failures:
+            failed_tiles = {failure.tile_id for failure in download_failures}
+            LOGGER.warning(
+                "Encountered %s download failures across %s tiles",
+                len(download_failures),
+                len(failed_tiles),
+            )
+            for failure in download_failures:
+                LOGGER.warning(
+                    "Tile %s (%s) failed to download %s: %s",
+                    failure.tile_id,
+                    failure.bm_path.name,
+                    failure.key,
+                    failure.error,
+                )
+
+        with metrics.measure("manifest_write"):
+            manifest = create_pair_manifest(bm_patches, dmsp_matches, manifest_path)
+        metrics.set_count("manifest_rows", len(manifest))
+
+        with metrics.measure("cleanup"):
+            manifest_df = manifest
+            if manifest_path.exists():
+                try:
+                    manifest_df = pd.read_csv(manifest_path)
+                except pd.errors.EmptyDataError:
+                    manifest_df = pd.DataFrame()
+
+            expected_bm: set[str] = set()
+            expected_dmsp: set[str] = {Path(match.dmsp_path).name for match in dmsp_matches}
+            if "bm_patch" in manifest_df.columns:
+                expected_bm.update(
+                    Path(path).name
+                    for path in manifest_df["bm_patch"].dropna().astype(str)
+                )
+            if "dmsp_patch" in manifest_df.columns:
+                expected_dmsp.update(
+                    Path(path).name
+                    for path in manifest_df["dmsp_patch"].dropna().astype(str)
+                )
+
+            def iter_rasters(directory: Path) -> Iterable[Path]:
+                seen: set[Path] = set()
+                for pattern in ("*.tif", "*.TIF"):
+                    for path in directory.glob(pattern):
+                        if path not in seen:
+                            seen.add(path)
+                            yield path
+
+            bm_removed = 0
+            if bm_dir.exists():
+                for bm_path in iter_rasters(bm_dir):
+                    if bm_path.name not in expected_bm:
+                        bm_path.unlink(missing_ok=True)
+                        bm_removed += 1
+
+            dmsp_removed = 0
+            if dmsp_dir.exists():
+                for dmsp_path in iter_rasters(dmsp_dir):
+                    if dmsp_path.name not in expected_dmsp:
+                        dmsp_path.unlink(missing_ok=True)
+                        dmsp_removed += 1
+
+            if bm_removed or dmsp_removed:
+                LOGGER.info(
+                    "Removed %s unmatched BM rasters and %s unmatched DMSP rasters",
+                    bm_removed,
+                    dmsp_removed,
+                )
+            else:
+                LOGGER.info("No unmatched BM or DMSP rasters were removed")
+
+        metrics.set_count("removed_bm_rasters", bm_removed)
+        metrics.set_count("removed_dmsp_rasters", dmsp_removed)
+    finally:
+        metrics.add_stage_time("total", time.perf_counter() - total_start)
+        metrics.write(timings_path)
+        LOGGER.info("Wrote timings to %s", timings_path)
 
 
 if __name__ == "__main__":
