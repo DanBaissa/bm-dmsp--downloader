@@ -21,9 +21,37 @@ fi
 
 mkdir -p ec2_full_run
 
-python data_sampler.py \
-  --samples-per-bin 2000 \
-  --patch-size 1000 \
-  --max-workers 4 \
-  --output-folder ec2_full_run \
-  --sampling-seed 13492
+for batch in 1 2 3 4; do
+  sampling_seed=$((13491 + batch))
+  date_seed=$((14491 + batch))
+  batch_dir="ec2_full_run/batch_${batch}"
+  complete_marker="${batch_dir}/.complete"
+  sampled_csv="${batch_dir}/sampled_locations.csv"
+
+  mkdir -p "$batch_dir"
+
+  if [ -f "$complete_marker" ]; then
+    echo "Skipping batch ${batch}; completion marker already exists"
+    continue
+  fi
+
+  echo "Starting batch ${batch} with sampling seed ${sampling_seed} and date seed ${date_seed}"
+
+  args=(
+    data_sampler.py
+    --samples-per-bin 500
+    --patch-size 1000
+    --max-workers 2
+    --output-folder "$batch_dir"
+    --sampling-seed "${sampling_seed}"
+    --date-seed "${date_seed}"
+  )
+
+  if [ -f "$sampled_csv" ]; then
+    echo "Resuming batch ${batch} from existing sampled_locations.csv"
+    args+=(--skip-sampling)
+  fi
+
+  python "${args[@]}"
+  touch "$complete_marker"
+done
