@@ -138,6 +138,62 @@ powershell -ExecutionPolicy Bypass -File .\aws\run_ec2_full_and_pull.ps1 -HostNa
 
 If you want a different output directory, worker count, or seeds, edit the shell script or run `python data_sampler.py` directly.
 
+### Running one fixed sample across many EC2 instances
+
+For a large run, the reliable pattern is:
+
+1. Generate one fixed `sampled_locations.csv`.
+2. Split it into disjoint shard CSVs.
+3. Launch one EC2 instance per shard with a large EBS-backed root volume.
+4. Warm each shard on that same instance and cache root.
+5. Run the full shard on that same instance and merge the outputs afterward.
+
+This repo now includes an AWS CLI-based launcher for that flow:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\aws\launch_fixed_sample_fleet.ps1 `
+  -ShardCount 10 `
+  -SamplesPerBin 2000 `
+  -WarmupRowsPerShard 25 `
+  -InstanceType m6i.2xlarge `
+  -VolumeSizeGiB 2000 `
+  -Profile coauthor-project `
+  -KeyName YOUR_EC2_KEY_NAME `
+  -KeyPath C:\path\to\key.pem `
+  -SubnetId subnet-... `
+  -SecurityGroupIds sg-...
+```
+
+What it does:
+
+- runs `python data_sampler.py --sample-only ...` locally to create one fixed sample CSV
+- splits that CSV into `shard_01.csv` ... `shard_10.csv` plus matching warm-up subset CSVs
+- launches one EC2 instance per shard via `aws ec2 run-instances`
+- provisions a large EBS-backed root volume on each instance
+- uploads the repo, `Data/`, `.env`, and the shard CSVs
+- bootstraps Ubuntu dependencies
+- runs `aws/run_fixed_shard_download.sh` remotely so each instance:
+  - warms its cache with the small shard subset
+  - runs the full shard against the same `--cache-root`
+
+Each instance keeps its cache under `/data/bm_dmsp_cache/<shard_id>` and outputs under `/data/bm_dmsp_runs/<shard_id>/`.
+
+To pull the results back and merge them:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\aws\pull_and_merge_fixed_sample_fleet.ps1 `
+  -InstancesCsv .\ec2_fixed_sample_fleet_YYYYMMDD_HHMMSS\instances.csv `
+  -KeyPath C:\path\to\key.pem
+```
+
+That downloads each shard's `full/` output and writes a merged dataset locally.
+
+Storage guidance:
+
+- `--samples-per-bin 2000` is a large run. Plan for multi-terabyte EBS, not the default EC2 disk size.
+- The launcher defaults to a `2000 GiB` `gp3` root volume per instance. Increase it if you expect broad date/tile coverage or want to retain warm caches for reruns.
+- The warm cache only helps when the same instance and same `--cache-root` are reused for later work.
+
 ## Testing
 
 The regression checks live in `tests/test_data_sampler.py`. The module stubs out heavyweight dependencies (e.g., `rasterio`, `geopandas`, `boto3`) so the suite can exercise the downloader’s control flow—dateline-aware CMR queries, worker failure handling, and missing tile metadata—without needing the full geospatial stack. Run the tests with:
