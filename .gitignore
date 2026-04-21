@@ -12,9 +12,4 @@ ec2_full_run/
 inspection_samples/
 local_benchmark_*/
 tests/__pycache__/
-aws/*
-!aws/run_benchmark_download.sh
-!aws/run_ec2_benchmark_and_pull.ps1
-!aws/run_fixed_shard_download.sh
-!aws/launch_fixed_sample_fleet.ps1
-!aws/pull_and_merge_fixed_sample_fleet.ps1
+aws/
